@@ -33,10 +33,10 @@ Before interacting with the API, it is essential to understand how identity and 
 
 The `did:web` method is a decentralized identifier that leverages a standard HTTPS domain name as its root of trust. It provides a simple and secure way to link a domain you control to a cryptographic identity.
 
-A `did:web` identifier is resolved to an HTTPS URL to retrieve a **DID Document** (a `did.json` file). This document contains the entity's public keys and service endpoints.
+A `did:web` identifier is resolved to an HTTPS URL to retrieve a **DID Document** (a `did.json` file). The method converts each `:` in the DID into a `/` in the URL path. This document contains the entity's public keys and service endpoints.
 
--   **DID:** `did:web:api.acme-hospital.com` resolves to **URL:** `https://api.acme-hospital.com/.well-known/did.json`
--   **DID:** `did:web:connector.host.com:acme-hospital` resolves to **URL:** `https://connector.host.com/acme-hospital/did.json`
+-   **Self-Hosted DID:** `did:web:api.acme-hospital.com` resolves to **URL:** `https://api.acme-hospital.com/.well-known/did.json`
+-   **Hosted DID:** `did:web:connector.host.com:acme-hospital:cds-es:v1:health-care` resolves to **URL:** `https://connector.host.com/acme-hospital/cds-es/v1/health-care/.well-known/did.json`
 
 All endpoints described in this guide are relative to the base URL derived from an entity's `did:web` identifier.
 
@@ -49,9 +49,9 @@ After an organization registers with the gateway's host, it will operate under o
     -   **`did:web` Example:** `did:web:api.acme-hospital.com`
     -   **Endpoint Base:** `https://api.acme-hospital.com/`
 
-2.  **Hosted:** The organization utilizes the shared infrastructure provided by the host connector. Its identity is namespaced under the host's domain.
-    -   **`did:web` Example:** `did:web:connector.host.com:acme-hospital`
-    -   **Endpoint Base:** `https://connector.host.com/acme-hospital/`
+2.  **Hosted:** The organization utilizes the shared infrastructure provided by the host connector. Its identity is namespaced under the host's domain, including path segments for the tenant ID, jurisdiction, version, and sector.
+    -   **`did:web` Example:** `did:web:connector.host.com:acme-hospital:cds-es:v1:health-care`
+    -   **Endpoint Base:** `https://connector.host.com/acme-hospital/cds-es/v1/health-care/`
 
 
 ---
