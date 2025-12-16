@@ -212,7 +212,7 @@ curl -X POST 'http://localhost:3000/host/cds-es/v1/test/registry/org.schema/Orga
   "exp": 1678886460,
   "iat": 1678886400,
   "nbf": 1678886400,
-  "type": "application/json+api",
+  "type": "application/api+json",
   "body": {
     "data": [
       {
@@ -310,7 +310,7 @@ The `aud` (audience) of the backend's response is the public encryption key of t
   "exp": 1678886460,
   "iat": 1678886400,
   "nbf": 1678886400,
-  "type": "application/json+api",
+  "type": "application/api+json",
   "body": {
     "data": [
       {
@@ -377,7 +377,7 @@ curl -X POST 'http://localhost:3000/host/cds-es/v1/test/registry/org.schema/Orde
   "exp": 1678886460,
   "iat": 1678886400,
   "nbf": 1678886400,
-  "type": "application/json+api",
+  "type": "application/api+json",
   "body": {
     "data": [
       {
@@ -509,14 +509,14 @@ Below is the **plaintext content** of the DIDComm message.
       "keys": [
         {
           "alg": "ML-DSA-44",
-          "kid": "thumbprint-sig-key",
+          "kid": "thumbprint-public-sig-key-device",
           "kty": "AKP",
           "pub": "mock-sig-key",
           "use": "sig"
         },
         {
           "crv": "ML-KEM-768",
-          "kid": "thumbprint-enc-key",
+          "kid": "thumbprint-public-enc-key-device",
           "kty": "OKP",
           "x": "mock-enc-key",
           "use": "enc"
@@ -678,7 +678,7 @@ curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/entity/org.schema
   "exp": 1678886460,
   "iat": 1678886400,
   "nbf": 1678886400,  
-  "type": "application/json+api",
+  "type": "application/api+json",
   "body": {
     "data": [{
       "type": "Employee-form-v1.0",
@@ -706,64 +706,95 @@ curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/entity/org.schema
 
 **Expected Response:** `202 Accepted` with a `Location` header. Polling this location retrieves the final outcome of the job.
 
-### 8.2. Step 6: Onboard an Individual (Customer)
+### 8.2. Step 6: Register a Family Organization
 
-After an employee (e.g., `receptionist1@acme.org`) has been created, they must first register their own device by following the same process in **Step 3** and **Step 4** to get their own `client_id` and a scoped `access_token`.
+A critical concept is that an individual or a group of related individuals (a family) are managed within their own `Organization` resource. This "Family Organization" is not a top-level tenant but is instead *hosted by* a tenant (e.g., a hospital or insurance provider). This model allows for consistent management of roles, consents, and licenses across all sectors.
 
-Once they have an `access_token` with the `customer.create` scope, they can onboard a new customer (individual). The `iss` of the request is now the employee's device `client_id`.
+Registration follows the same secure, asynchronous **Offer/Order pattern** as a top-level tenant. There are two primary scenarios for creating a family organization:
 
-**Endpoint:** `POST /{tenantId}/cds-{jurisdiction}/v1/{sector}/individual/org.schema/Person/_batch`
+1.  **Individual Self-Service:** An individual uses their own OIDC `id_token` to register their family. They act as the first controller and are responsible for paying for any required licenses.
+2.  **Employee-Assisted:** An employee of a tenant (e.g., a hospital receptionist) uses a scoped `SMART token` to register a family on behalf of a patient. The tenant organization's license pool is used.
+
+The endpoint is the same in both cases, but the authorization method differs.
+
+**Endpoint:** `POST /{tenantId}/cds-{jurisdiction}/v1/{sector}/individual/org.schema/Organization/_batch`
+
+#### Scenario A: Individual Self-Service Registration
+
+In this flow, the individual authenticates themselves with an `id_token`. The `iss` in the payload should be their email or another unique identifier.
 
 **`curl` Example:**
 ```bash
-curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/individual/org.schema/Person/_batch' \
+curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/individual/org.schema/Organization/_batch' \
 --header 'App-ID: [APP-ID]' \
 --header 'App-Version: [APP-VERSION]' \
-# The Bearer token is a SMART access_token with 'customer.create' scope.
---header 'Authorization: Bearer [SMART_TOKEN_FOR_EMPLOYEE]' \
+# Authorization is the individual's OIDC id_token.
+--header 'Authorization: Bearer [OIDC_ID_TOKEN_OF_INDIVIDUAL]' \
 --header 'Content-Type: application/didcomm-plaintext+json' \
 --data '{
-  "jti": "customer-onboard-request-id",
-  "thid": "customer-onboard-thread-id",
-  # The 'iss' is the client_id of the employee's device.
-  "iss": "did:web:api.acme.org:employee:receptionist1@acme.org:device:<uuid>",
+  "jti": "family-registration-request-id",
+  "thid": "family-registration-thread-id",
+  "iss": "adult1@example.com",
   "aud": "did:web:api.acme.org",
-  "exp": 1678886460,
-  "iat": 1678886400,
-  "nbf": 1678886400,   
-  "type": "application/json+api",
+  "type": "application/api+json",
   "body": {
-    "data": [
-      {
-        "type": "Individual-terms-v1.0",
-        "meta": {
-          "claims": {
-            "org.schema.Person.alternateName": "Joe",
-            "org.schema.Person.identifier": "urn:uuid:8e0d846a-2492-4b9c-8a4e-5e065fb6ba76",
-            "org.schema.Person.email": "customer1@example.com",
-            "org.schema.Service.category": "health-care",
-            "org.schema.Service.serviceType": "http://terminology.hl7.org/CodeSystem/v3-ActReason|FAMRQT,PWATRNY,METAMGT,FRAUD,RECORDMGT,COVAUTH,TREAT,DISASTER,HPAYMT,MLTRAINING,ETREAT,HOPERAT,CAREMGT,HSYSADMIN,PATADMIN,PATSFTY",            
-            "org.schema.Service.termsOfService": "data:application/pdf;base64,JVBERi0xLjQKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyAvUGFnZXMgMiAwIFIgPj4KZW5kb2JqCjIgMCBvYmoKPDwgL1R5cGUgL1BhZ2VzIC9LaWRzIFszIDAgUl0gL0NvdW50IDEgPj4KZW5kb2JqCjMgMCBvYmoKPDwgL1R5cGUgL1BhZ2UgL1BhcmVudCAyIDAgUiAvTWVkaWFCb3ggWzAgMCAzMDAgMjAwXSAvQ29udGVudHMgNCAwIFIgL1Jlc291cmNlcyA8PCAvRm9udCA8PCAvRjEgNSAwIFIgPj4+PiA+PgplbmRvYmoKNCAwIG9iago8PCAvTGVuZ3RoIDQ0ID4+CnN0cmVhbQpCVAovRjEgMjQgVGYKMTAwIDEwMCBUZAooSGVsbG8gUERGKSBUagoKRVQKZW5kc3RyZWFtCmVuZG9iago1IDAgb2JqCjw8IC9UeXBlIC9Gb250IC9TdWJ0eXBlIC9UeXBlMSAvQmFzZUZvbnQgL0hlbHZldGljYSA+PgplbmRvYmoKeHJlZgowIDYKMDAwMDAwMDAwMCA2NTUzNSBmIAowMDAwMDAwMDEwIDAwMDAwIG4gCjAwMDAwMDAwNTMgMDAwMDAgbiAKMDAwMDAwMDEwNiAwMDAwMCBuIAowMDAwMDAwMjU1IDAwMDAwIG4gCjAwMDAwMDAzNDMgMDAwMDAgbiAKdHJhaWxlcgo8PCAvU2l6ZSA2IC9Sb290IDEgMCBSID4+CnN0YXJ0eHJlZgo0MDMKJSVFT0Y="
-          }
-        },
-        "request": { "method": "POST", "url": "individual/org.schema/Person/" }
-      },
-      {
-        "type": "Personal-identity-v1.0",
-        "meta": {
-          "claims": {
-            "org.schema.Person.identifier": "urn:uuid:8e0d846a-2492-4b9c-8a4e-5e065fb6ba76",
-            "org.schema.Person.identifierType": "NNES",
-            "org.schema.Person.identifierValue": "12345678X"
-          }
-        },
-        "request": { "method": "POST", "url": "individual/org.schema/Person/" }
+    "data": [{
+      "type": "Family-registration-form-v1.0",
+      "meta": {
+        "claims": {
+          "@context": "org.schema",
+          "@type": "template",
+          "Organization.identifier": "urn:uuid:<family-uuid>",
+          "Organization.name": "Family of John Doe",
+          "Person.alternateName": "Joe",
+          "Person.email": "adult1@example.com",
+          "Person.familyName": "Doe",
+          "Person.givenName": "John",
+          "Person.identifier": "urn:uuid:8e0d846a-2492-4b9c-8a4e-5e065fb6ba76",
+          "Service.category": "health-care",
+          "Service.serviceType": "http://terminology.hl7.org/CodeSystem/v3-ActReason|FAMRQT,PWATRNY,METAMGT,FRAUD,RECORDMGT,COVAUTH,TREAT,DISASTER,HPAYMT,MLTRAINING,ETREAT,HOPERAT,CAREMGT,HSYSADMIN,PATADMIN,PATSFTY",        
+          "Service.termsOfService": "data:application/pdf;base64,JVBERi0xLjQKMSAw..."
+        }
       }
-    ]
+    }]
+  },
+  "meta": {
+    "jwe": { "header": { "jwk": { "...": "..." }}},
+    "jws": { "protected": { "jwk": { "...": "..." }}}
   }
 }' -i
 ```
-**Expected Response:** `202 Accepted` with a `Location` header. Polling retrieves the outcome of the customer onboarding job.
+
+The server responds with a `202 Accepted` and a `Location` header pointing to the polling endpoint. The response, once ready, will contain an `Offer` that must be confirmed.
+
+#### 8.2.1. Step 6a: Confirm the Family Order
+
+To complete the registration, the individual must accept the `Offer` by submitting an `Order`, identical to the flow in Step 2. This confirms the terms and leads to the payment step.
+
+```bash
+curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/individual/org.schema/Order/_batch' \
+--header 'Authorization: Bearer [OIDC_ID_TOKEN_OF_INDIVIDUAL]' \
+--header 'Content-Type: application/didcomm-plaintext+json' \
+--data '{
+  "jti": "family-order-request-id",
+  "thid": "family-order-thread-id",
+  "iss": "adult1@example.com",
+  "aud": "did:web:api.acme.org",
+  "type": "application/api+json",
+  "body": {
+    "data": [{
+      "type": "Family-order-request-v1.0",
+      "meta": {
+        "claims": {
+          "@context": "org.schema",
+          "Order.acceptedOffer.identifier": "urn:cds-<jurisdiction>:v1:health-care:product:org.schema:Offer:<family-offer-uuid>"
+        }
+      }
+    }]
+  }
+}' -i
+```
+After polling, the final response will contain the payment URL to finalize the purchase of the family license(s). Once paid, the Family Organization is active.
 
 ### 8.3. Step 7: Create a Consent Record
 
@@ -795,17 +826,16 @@ curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/individual/org.hl
       "meta": {
         "claims": {
           "@context": "org.hl7.fhir.r4",
-          "decision": "permit",
-          "subject": "did:web:api.acme.org:individual:customer1@example.com",
-          "identifier": "urn:uuid:patient-consent-uuid",
-          "grantee": "did:web:hospital.example.com",
-          "date": "2025-11-25",
-          "purpose": "TREAT",
-          "action": "LOINC|48765-2",
-          "actor-identifier": "did:web:hospital.example.com",
-          "actor-role": "ISCO-08|2221",
-          "attachment-contentType": "application/odrl+json",
-          "attachment-data": "eyAiQGNvbnRleHQiOiAiaHR0cDovL3d3dy53My5vcmcvbnMvb2RybC5qc29ubGQiLCAiQHR5cGUiOiAiQWdyZWVtZW50Ii...sgIlRSRUFUIiB9XSB9XSB9"
+          "Consent.action": "LOINC|48765-2",
+          "Consent.actor-reference": "did:web:hospital.example.com",
+          "Consent.actor-role": "ISCO-08|2221",
+          "Consent.attachment-contentType": "application/odrl+json",
+          "Consent.attachment-data": "eyAiQGNvbnRleHQiOiAiaHR0cDovL3d3dy53My5vcmcvbnMvb2RybC5qc29ubGQiLCAiQHR5cGUiOiAiQWdyZWVtZW50Ii...sgIlRSRUFUIiB9XSB9XSB9",
+          "Consent.date": "2025-11-25",
+          "Consent.decision": "permit",
+          "Consent.identifier": "urn:uuid:patient-consent-uuid",
+          "Consent.purpose": "TREAT",
+          "Consent.subject": "did:web:api.acme.org:individual:<unified-health-identifier>"
         }
       },         
       "request": {
@@ -813,28 +843,28 @@ curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/individual/org.hl
         "url": "individual/org.hl7.fhir.r4/Consent"
       },
       "resource": {   
-        "identifier": [{ "value": "urn:uuid:patient-consent-uuid" }],
-        "resourceType": "Consent",
-        "status": "active",
-        "scope": {
-          "coding": [{ 
-            "system": "http://terminology.hl7.org/CodeSystem/consentscope",
-            "code": "patient-privacy"
-          }]
-        },
         "category": [{
           "coding": [{
             "system": "http://terminology.hl7.org/CodeSystem/consentcategorycodes",
             "code": "TREAT"
           }]
         }],
-        "patient": { "reference": "did:web:api.acme.org:individual:customer1@example.com" },
+        "identifier": [{ "value": "urn:uuid:patient-consent-uuid" }],
         "performer": [{ "reference": "did:web:hospital.example.com" }],
         "provision": { "type": "permit" },
+        "resourceType": "Consent",
+        "scope": {
+          "coding": [{ 
+            "system": "http://terminology.hl7.org/CodeSystem/consentscope",
+            "code": "patient-privacy"
+          }]
+        },
         "sourceAttachment": {
           "contentType": "application/odrl+json",
           "data": "eyAiQGNvbnRleHQiOiAiaHR0cDovL3d3dy53My5vcmcvbnMvb2RybC5qc29ubGQiLCAiQHR5cGUiOiAiQWdyZWVtZW50Ii...sgIlRSRUFUIiB9XSB9XSB9"
-        }
+        },
+        "status": "active",
+        "subject": { "reference": "did:web:api.acme.org:individual:<unified-health-identifier>" }
       }
     }]
   }
@@ -858,42 +888,508 @@ curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/individual/org.hl
 --data '{
   "jti": "communication-fhir-request-id",
   "thid": "communication-fhir-thread-id",
-  "iss": "did:web:api.acme.org:employee:receptionist1@acme.org:device:<uuid>",
+  "iss": "did:web:hospital.example.com",
   "aud": "did:web:api.acme.org",
   "exp": 1678886460,
   "iat": 1678886400,
   "nbf": 1678886400,   
-  "type": "org.hl7.fhir.r4.Communication",
+  "type": "org.hl7.fhir.r4.Bundle",
   "body": {
-    "resourceType": "Communication",
-    "status": "completed",
-    "partOf": [{ "reference": "urn:uuid:communication-channel-id" }],
-    "category": [{ 
-      "coding": [{
-        "code": "appointment-reminder",
-        "system": "http://terminology.hl7.org/CodeSystem/communication-category"
-      }]
-    }],
-    "recipient": [ { "reference": "did:web:api.acme.org:individual:customer1@example.com" } ],
-    "sender": { "reference": "did:web:api.acme.org" },
-    "sent": "2025-10-15T14:30:00Z",
-    "note": [
-      { "text": "This is your new appointment. Best regards." }
-    ],
-    "payload": [{
-      "contentReference": {
-        "reference": "https://url-to-appointment-source.com/some-uuid"
+    "entry": [{
+      meta: {
+        claims: {
+          "@context": "org.hl7.fhir.api",
+          "@type": "Communication:Appointment",
+          "Communication.category": "http://terminology.hl7.org/CodeSystem/communication-category|appointment-reminder",
+          "Communication.content-attachment-data": "QkVHSU4...5EQVI=",
+          "Communication.content-attachment-title": "appointment-details.ics",
+          "Communication.content-attachment-type": "text/calendar",
+          "Communication.content-reference": "https://url-to-appointment-source.com/some-uuid",
+          "Communication.partOf": "urn:uuid:communication-channel-id",
+          "Communciation.recipient": "did:web:api.acme.org:individual:<unified-health-identifier>",
+          "Communication.sender": { "reference": "did:web:hospital.example.com" },
+          "Communication.sent": "2025-10-15T14:30:00Z",        
+          "Communciation.subject": "did:web:api.acme.org:individual:<unified-health-identifier>",
+          "Communication.text": "<br>This is your new appointment. Best regards.</br>"
+        }
+      },    
+      "request": {
+        "method": "POST",
+        "url": "individual/org.hl7.fhir.r4/Communication"
+      },
+      "resource": {
+        "category": [{ 
+          "coding": [{
+            "code": "appointment-reminder",
+            "system": "http://terminology.hl7.org/CodeSystem/communication-category"
+          }]
+        }],
+        "note": [
+          { "text": "This is your new appointment. Best regards." }
+        ],
+        "partOf": [{ "reference": "urn:uuid:communication-channel-id" }],
+        "payload": [
+          {
+            "contentAttachment": {
+              "contentType": "text/calendar",
+              "data": "QkVHSU46VkNBTEVOREFSCgpWRVJTSU9OOjIuMApQUk9ESUQ6LS8vQWNtZS8vZGlkOndlYjphcGkuYWNtZS5vcmcvL0VTCkJFR0lOOlZFVkVOVApVSUQ6PHV1aWQtdjQ+CkRUU1BTVA6MjAyNTEwMTZUMTIwMDAwWgpEVFNUQVJUOjIwMjUxMDE3VDE1MDAwMFoKRF RFTkQ6MjAyNTEwMTdUMTYwMDAwWgpTVU1NQVJZOlJlc3VtZW4gZGUgY2l0YS4KREVTQ1JJUFRJT046RW5jdWVudHJvIHZpcnR1YWwuCkxPQ0FUSU9OOk9ubGluZQpFTkQ6VkVWRU5UCkVORDpWQ0FMRU5EQVI=",
+              "title": "appointment-details.ics"
+            }
+          },
+          {
+            "contentReference": { "reference": "https://url-to-appointment-source.com/some-uuid" }
+          }
+        ],
+        "recipient": [ { "reference": "did:web:api.acme.org:individual:<unified-health-identifier>" } ],
+        "resourceType": "Communication",
+        "sender": { "reference": "did:web:hospital.example.com" },
+        "sent": "2025-10-15T14:30:00Z",
+        "status": "completed"
       }
     },
-    {
-      "contentAttachment": {
-        "contentType": "text/calendar",
-        "data": "QkVHSU46VkNBTEVOREFSCgpWRVJTSU9OOjIuMApQUk9ESUQ6LS8vQWNtZS8vZGlkOndlYjphcGkuYWNtZS5vcmcvL0VTCkJFR0lOOlZFVkVOVApVSUQ6PHV1aWQtdjQ+CkRUU1BTVA6MjAyNTEwMTZUMTIwMDAwWgpEVFNUQVJUOjIwMjUxMDE3VDE1MDAwMFoKRF RFTkQ6MjAyNTEwMTdUMTYwMDAwWgpTVU1NQVJZOlJlc3VtZW4gZGUgY2l0YS4KREVTQ1JJUFRJT046RW5jdWVudHJvIHZpcnR1YWwuCkxPQ0FUSU9OOk9ubGluZQpFTkQ6VkVWRU5UCkVORDpWQ0FMRU5EQVI=",
-        "title": "appointment-details.ics"
-      }
+    "resourceType": "Bundle",
+    "type": "batch"
+  }]
+}' -i
+```
+
+**Expected Response:** `202 Accepted` with a `Location` header. Polling retrieves the outcome of the communication job.
+
+### 9. Step 9: Update the Unified Health Index (Composition)
+
+This is the core function of the UHIx. An authorized healthcare provider (e.g., some clinic where the patient received care) can update the patient's Unified Health Index with a new entry. The index is a FHIR `Composition` resource, which acts as a master "table of contents."
+
+In this example, a practitioner from `hospital.example.com`, having been granted consent by the patient (see Step 7), is updating the patient's index with new entries for the `Allergies and Intollerances` section . They do this by submitting one or more compositions of documents with the links to the resoruces where the patient or other authorized players will be able to retrieve the information (based on the consents).
+
+**Endpoint:** `POST /{tenantId}/cds-{jurisdiction}/v1/{sector}/individual/org.hl7.fhir.r4/Composition/_batch`
+
+**`curl` Example:**
+```bash
+curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/individual/org.hl7.fhir.r4/Composition/_batch' \
+--header 'App-ID: [APP-ID]' \
+--header 'App-Version: [APP-VERSION]' \
+# Token obtained by the external practitioner with scope 'user/Composition.write'
+--header 'Authorization: Bearer [SMART_TOKEN_FOR_COMPOSITION]' \
+--header 'Content-Type: application/didcomm-plaintext+json' \
+--data '{
+  "jti": "composition-update-request-id",
+  "thid": "composition-update-thread-id",
+  "iss": "did:web:hospital.example.com",
+  "aud": "did:web:api.acme.org",
+  "exp": 1678886460,
+  "iat": 1678886400,
+  "nbf": 1678886400,   
+  "type": "org.hl7.fhir.r4.Bundle",
+  "body": {
+    "entry": [{
+      "meta": {
+        "claims": {
+          "Composition.author: "did:web:hospital.example.com",
+          "Composition.date": "2025-11-26T10:00:00Z",
+          "Composition.entry": "https://ehr.hospital.example.com/fhir/AllergyIntolerance/12345,https://ehr.hospital.example.com/fhir/DiagnosticReport/67890" }",
+          "Composition.section": "LOINC|48765-2",
+          "Composiiton.subject": "did:web:api.acme.org:individual:<unified-health-identifier>",
+          "Composition.title": "Allergies and Intolerances: hospital.example.com (2025-11-26T10:00:00Z)",
+          "Composition.type": "LOINC|60591-5",
+        },
+      },
+      "request": {
+        "method": "POST",
+        "url": "individual/org.hl7.fhir.r4/Composition"
+      },
+      "resource": {
+        "author": [
+          { "reference": "did:web:hospital.example.com" }
+        ],
+        "date": "2025-11-26T10:00:00Z",
+        "resourceType": "Composition",
+        "section": [
+          {
+            "code": { "coding": [{ "system": "http://loinc.org", "code": "48765-2" }] },
+            "entry": [
+              { "reference": "https://ehr.hospital.example.com/fhir/AllergyIntolerance/12345" },
+              { "reference": "https://ehr.hospital.example.com/fhir/DiagnosticReport/67890" }
+            ],
+            "title": "Allergies and Intolerances"
+          }
+        ]
+        "subject": { "reference": "did:web:api.acme.org:individual:<unified-health-identifier>" },
+        "status": "final",
+        "title": "Allergies and Intolerances: hospital.example.com (2025-11-26T10:00:00Z)",
+        "type": {
+          "coding": [{
+            "system": "http://loinc.org",
+            "code": "60591-5",
+          }]
+        },
+      },
+      "resourceType": "Bundle",
+      "type": "batch"
     }]
   }
 }' -i
 ```
 
-**Expected Response:** `202 Accepted` with a `Location` header. Polling retrieves the outcome of the communication job.
+**Expected Response:** `202 Accepted`. After polling, a successful response confirms that the patient's Unified Health Index has been updated with the new entry, allowing any other authorized provider to discover this new piece of health information.
+
+---
+
+### 10. Managing Individual Health Data via Bundle Documents
+
+A core feature of the Unified Health Index is to ensure that a consolidated version of an individual's unified clinical history remains available and under their control. This is achieved through a two-part process involving FHIR Bundle documents:
+
+1.  **Aggregation of Source Documents:** Authorized users or providers can upload individual FHIR Bundle documents (such as clinical summaries, lab results, or vaccination records) to the individual's data index using this endpoint. Each upload serves as a secure backup and a building block for the unified history.
+
+2.  **Consolidation and Secure Sharing:** The user's application can then generate a new, consolidated FHIR Bundle document that represents the complete, up-to-date Unified Health Index. This unified clinical history can then be securely shared with a new provider or family member via a `Communication` request, as detailed in **Section 8.4**.
+
+The endpoint below is the mechanism for uploading **any** FHIR Bundle document—whether a source document or a consolidated history—into the user's secure data store.
+
+**Endpoint:** `POST /{tenantId}/cds-{jurisdiction}/v1/{sector}/individual/org.hl7.fhir.r4/Bundle/_document`
+
+**`curl` Example:**
+```bash
+curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/individual/org.hl7.fhir.r4/Bundle/_document_' \
+--header 'App-ID: [APP-ID]' \
+--header 'App-Version: [APP-VERSION]' \
+# Token obtained by the external practitioner with scope 'user/Composition.write'
+--header 'Authorization: Bearer [SMART_TOKEN_FOR_BUNDLE_DOC]' \
+--header 'Content-Type: application/didcomm-plaintext+json' \
+--data '{
+  "jti": "document-update-request-id",
+  "thid": "document-update-thread-id",
+  "iss": "did:web:api.acme.org:individual:<unified-health-id>:device:<id>
+  "aud": "did:web:api.acme.org",
+  "exp": 1678886460,
+  "iat": 1678886400,
+  "nbf": 1678886400,   
+  "type": "org.hl7.fhir.r4.Bundle",
+  "body": {
+    "identifier": {
+      "system": "http://hl7.eu/fhir/sid/uvci",
+      "value": "V1IT454557891308174803488707671418",
+      "period": {
+        "start": "2025-02-10"
+      }
+    },
+    "resourceType": "Bundle",
+    "timestamp": "2025-02-10T14:30:00+01:00",
+    "type": "document",
+    "entry": [
+      {
+        "fullUrl": "urn:uuid:30551ce1-5a28-4356-b684-1e639094ad4d",
+        "resource": {
+          "resourceType": "Composition",
+          "id": "30551ce1-5a28-4356-b684-1e639094ad4d",
+          "text": {
+            "status": "generated",
+            "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><p><b>Generated Narrative</b></p><p><b>identifier</b>: id: 3f69e0a5-2177-4540-baab-7a5d0877428f</p><p><b>status</b>: final</p><p><b>type</b>: <span title=\"Codes: {http://loinc.org 82593-5}\">Immunization summary report</span></p><p><b>date</b>: Feb 10, 2021, 1:30:00 PM</p><p><b>author</b>: <a href=\"#Practitioner_d7a490a1-d267-4785-ac98-db56748827fb\">See above (Practitioner/d7a490a1-d267-4785-ac98-db56748827fb)</a></p><p><b>title</b>: Vaccine Certificate Covid-19</p><h3>Attesters</h3><table class=\"grid\"><tr><td>-</td><td><b>Mode</b></td><td><b>Time</b></td><td><b>Party</b></td></tr><tr><td>*</td><td>legal</td><td>Dec 27, 2020, 1:30:00 PM</td><td><a href=\"#Organization_45a5c5b1-4ec1-4d60-b4b2-ff5a84a41fd7\">See above (Organization/45a5c5b1-4ec1-4d60-b4b2-ff5a84a41fd7)</a></td></tr></table><p><b>custodian</b>: <a href=\"#Organization_b66c1b23-21e9-4bd0-9cd7-edd806c126de\">See above (Organization/b66c1b23-21e9-4bd0-9cd7-edd806c126de)</a></p></div>"
+          },
+          "identifier": {
+            "system": "urn:oid:2.16.724.4.8.10.200.10",
+            "value": "3f69e0a5-2177-4540-baab-7a5d0877428f"
+          },
+          "status": "final",
+          "type": {
+            "coding": [
+              {
+                "system": "http://loinc.org",
+                "code": "82593-5",
+                "display": "Immunization summary report"
+              }
+            ]
+          },
+          "subject": {
+            "reference": "urn:uuid:2b90dd2b-2dab-4c75-9bb9-a355e07401e8"
+          },
+          "date": "2025-02-10T14:30:00+01:00",
+          "author": [
+            {
+              "reference": "urn:uuid:d7a490a1-d267-4785-ac98-db56748827fb"
+            }
+          ],
+          "title": "Vaccine Certificate Covid-19",
+          "attester": [
+            {
+              "mode": "legal",
+              "time": "2020-12-27T14:30:00+01:00",
+              "party": {
+                "reference": "urn:uuid:45a5c5b1-4ec1-4d60-b4b2-ff5a84a41fd7"
+              }
+            }
+          ],
+          "custodian": {
+            "reference": "urn:uuid:b66c1b23-21e9-4bd0-9cd7-edd806c126de"
+          },
+          "section": [
+            {
+              "title": "Vaccinations",
+              "code": {
+                "coding": [
+                  {
+                    "system": "http://loinc.org",
+                    "code": "11369-6",
+                    "display": "Hx of Immunization"
+                  }
+                ]
+              },
+              "text": {
+                "status": "generated",
+                "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><p><strong>Maria Rossi (RSSMRA97L67Z602C)</strong></p><p><span>COVID-19 mRNA Vaccine&nbsp;</span></p><p>Last Update: 2025-02-05</p><ol><li>Dose 1/2<ol><li>Date and time of vaccination: 2025-01-10</li><li><span>AIC#049283: COVID-19 Vaccine Moderna (MODERNA BIOTECH SPAIN, S.L.) - Lot#B1235742&nbsp;</span></li><li>Ospedale Careggi - Firenze</li></ol></li><li>Dose 2/2<ol><li>Date vaccine due: 2025-02-07</li><li>Status: contraindicated (Medical Precaution)</li></ol></li></ol></div>"
+              },
+              "entry": [
+                {
+                  "reference": "urn:uuid:42befbaf-eba8-44ec-b7d6-0e4a996e0760"
+                },
+                {
+                  "reference": "urn:uuid:c220e36c-eb67-4fc4-9ba1-2fabc52acec6"
+                }                
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "fullUrl": "urn:uuid:2b90dd2b-2dab-4c75-9bb9-a355e07401e8",
+        "resource": {
+          "resourceType": "Patient",
+          "id": "2b90dd2b-2dab-4c75-9bb9-a355e07401e8",
+          "text": {
+            "status": "generated",
+            "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><p><b>Generated Narrative</b></p><p><b>identifier</b>: id: RSSMRA97L67Z602C</p><p><b>name</b>: Maria Rossi </p><p><b>gender</b>: female</p><p><b>birthDate</b>: 1997-07-28</p></div>"
+          },
+          "identifier": [
+            {
+              "system": "http://hl7.it/sid/codiceFiscale",
+              "value": "RSSMRA97L67Z602C"
+            }
+          ],
+          "name": [
+            {
+              "family": "Rossi",
+              "given": [
+                "Maria"
+              ]
+            }
+          ],
+          "gender": "female",
+          "birthDate": "1990-07-28",
+          "address": {
+            "country": "CA"
+          }          
+        }
+      },
+      {
+        "fullUrl": "urn:uuid:c220e36c-eb67-4fc4-9ba1-2fabc52acec6",
+        "resource": {
+          "resourceType": "ImmunizationRecommendation",
+          "id": "c220e36c-eb67-4fc4-9ba1-2fabc52acec6",
+          "text": {
+            "status": "generated",
+            "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><p><b>Generated Narrative</b></p><p><b>patient</b>: <a href=\"#Patient_2b90dd2b-2dab-4c75-9bb9-a355e07401e8\">See above (Patient/2b90dd2b-2dab-4c75-9bb9-a355e07401e8)</a></p><p><b>date</b>: 2025-02-05</p><blockquote><p><b>recommendation</b></p><p><b>vaccineCode</b>: <span title=\"Codes: {http://snomed.info/sct 1119349007}\">Severe acute respiratory syndrome coronavirus 2 mRNA only vaccine product</span></p><p><b>forecastStatus</b>: <span title=\"Codes: {http://terminology.hl7.org/CodeSystem/immunization-recommendation-status contraindicated}\">Contraindicated</span></p><p><b>forecastReason</b>: <span title=\"Codes: {http://terminology.hl7.org/CodeSystem/v3-ActReason MEDPREC}\">medical precaution</span></p><h3>DateCriterions</h3><table class=\"grid\"><tr><td>-</td><td><b>Code</b></td><td><b>Value</b></td></tr><tr><td>*</td><td><span title=\"Codes: {http://loinc.org 30980-7}\">Date vaccine due</span></td><td>2025-02-07</td></tr></table><p><b>doseNumber</b>: 2</p><p><b>seriesDoses</b>: 2</p><p><b>supportingImmunization</b>: <a href=\"#Immunization_42befbaf-eba8-44ec-b7d6-0e4a996e0760\">See above (Immunization/42befbaf-eba8-44ec-b7d6-0e4a996e0760)</a></p></blockquote></div>"
+          },
+          "patient": {
+            "reference": "urn:uuid:2b90dd2b-2dab-4c75-9bb9-a355e07401e8"
+          },
+          "date": "2025-02-05",
+          "recommendation": [
+            {
+              "vaccineCode": [
+                {
+                  "coding": [
+                    {
+                      "system": "http://snomed.info/sct",
+                      "code": "1119349007",
+                      "display": "Severe acute respiratory syndrome coronavirus 2 mRNA only vaccine product"
+                    }
+                  ]
+                }
+              ],
+              "forecastStatus": {
+                "coding": [
+                  {
+                    "system": "http://terminology.hl7.org/CodeSystem/immunization-recommendation-status",
+                    "code": "contraindicated"
+                  }
+                ]
+              },
+              "forecastReason": [
+                {
+                  "coding": [
+                    {
+                      "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+                      "code": "MEDPREC",
+                      "display": "medical precaution"
+                    }
+                  ]
+                }
+              ],
+              "dateCriterion": [
+                {
+                  "code": {
+                    "coding": [
+                      {
+                        "system": "http://loinc.org",
+                        "code": "30980-7",
+                        "display": "Date vaccine due"
+                      }
+                    ]
+                  },
+                  "value": "2025-02-07"
+                }
+              ],
+              "doseNumberPositiveInt": 2,
+              "seriesDosesPositiveInt": 2,
+              "supportingImmunization": [
+                {
+                  "reference": "urn:uuid:42befbaf-eba8-44ec-b7d6-0e4a996e0760"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "fullUrl": "urn:uuid:45a5c5b1-4ec1-4d60-b4b2-ff5a84a41fd7",
+        "resource": {
+          "resourceType": "Organization",
+          "id": "45a5c5b1-4ec1-4d60-b4b2-ff5a84a41fd7",
+          "text": {
+            "status": "generated",
+            "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><p><b>Generated Narrative</b></p><p><b>identifier</b>: id: 090903</p><p><b>name</b>: AZ. OSPEDALIERO - UNIVERSITARIA CAREGGI</p></div>"
+          },
+          "identifier": [
+            {
+              "system": "http://terminology.hl7.it/CodeSystem/minsan-hsp",
+              "value": "090903"
+            }
+          ],
+          "name": "AZ. OSPEDALIERO - UNIVERSITARIA CAREGGI"
+        }
+      },
+      {
+        "fullUrl": "urn:uuid:b66c1b23-21e9-4bd0-9cd7-edd806c126de",
+        "resource": {
+          "resourceType": "Organization",
+          "id": "b66c1b23-21e9-4bd0-9cd7-edd806c126de",
+          "text": {
+            "status": "generated",
+            "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><p><b>Generated Narrative</b></p><p><b>identifier</b>: id: 090</p><p><b>name</b>: Regione Toscana</p></div>"
+          },
+          "identifier": [
+            {
+              "system": "http://terminology.hl7.it/CodeSystem/minsan-regione",
+              "value": "090"
+            }
+          ],
+          "name": "Regione Toscana"
+        }
+      },
+      {
+        "fullUrl": "urn:uuid:d7a490a1-d267-4785-ac98-db56748827fb",
+        "resource": {
+          "resourceType": "Practitioner",
+          "id": "d7a490a1-d267-4785-ac98-db56748827fb",
+          "text": {
+            "status": "generated",
+            "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><p><b>Generated Narrative</b></p><p><b>identifier</b>: id: VRDRCR70H08H703B</p></div>"
+          },
+          "identifier": [
+            {
+              "system": "http://hl7.it/sid/codiceFiscale",
+              "value": "VRDRCR70H08H703B"
+            }
+          ]
+        }
+      },
+      {
+        "fullUrl": "urn:uuid:42befbaf-eba8-44ec-b7d6-0e4a996e0760",
+        "resource": {
+          "resourceType": "Immunization",
+          "id": "42befbaf-eba8-44ec-b7d6-0e4a996e0760",
+          "text": {
+            "status": "generated",
+            "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><p><b>Generated Narrative</b></p><p><b>status</b>: completed</p><p><b>vaccineCode</b>: <span title=\"Codes: {http://snomed.info/sct 1119349007}, {https://www.aifa.gov.it/aic 049283}\">COVID-19 Vaccine Moderna</span></p><p><b>patient</b>: <a href=\"#Patient_2b90dd2b-2dab-4c75-9bb9-a355e07401e8\">See above (Patient/2b90dd2b-2dab-4c75-9bb9-a355e07401e8)</a></p><p><b>occurrence</b>: 2025-01-10</p><p><b>location</b>: <a href=\"#Location_55a5c5b1-4ec1-4d60-b4b2-ff5a84a41fd8\">See above (Location/55a5c5b1-4ec1-4d60-b4b2-ff5a84a41fd8)</a></p><p><b>manufacturer</b>: <span>MODERNA BIOTECH SPAIN, S.L.</span></p><p><b>lotNumber</b>: B1235742</p><blockquote><p><b>performer</b></p><p><b>actor</b>: <a href=\"#Organization_45a5c5b1-4ec1-4d60-b4b2-ff5a84a41fd7\">Ospedale Careggi - Firenze. Generated Summary: id: 090903; name: AZ. OSPEDALIERO - UNIVERSITARIA CAREGGI</a></p></blockquote><blockquote><p><b>performer</b></p><p><b>actor</b>: <a href=\"#Practitioner_d7a490a1-d267-4785-ac98-db56748827fb\">See above (Practitioner/d7a490a1-d267-4785-ac98-db56748827fb)</a></p></blockquote><h3>ProtocolApplieds</h3><table class=\"grid\"><tr><td>-</td><td><b>TargetDisease</b></td><td><b>DoseNumber[x]</b></td><td><b>SeriesDoses[x]</b></td></tr><tr><td>*</td><td><span title=\"Codes: {http://hl7.org/fhir/sid/icd-10 J12.82}\">Pneumonia due to coronavirus disease 2019</span></td><td>1</td><td>2</td></tr></table></div>"
+          },
+          "status": "completed",
+          "vaccineCode": {
+            "coding": [
+              {
+                "system": "http://snomed.info/sct",
+                "code": "1119349007",
+                "display": "Severe acute respiratory syndrome coronavirus 2 mRNA only vaccine product"
+              },
+              {
+                "system": "https://www.aifa.gov.it/aic",
+                "code": "049283",
+                "display": "COVID-19 Vaccine Moderna"
+              }
+            ],
+            "text": "COVID-19 Vaccine Moderna"
+          },
+          "patient": {
+            "reference": "urn:uuid:2b90dd2b-2dab-4c75-9bb9-a355e07401e8"
+          },
+          "occurrenceDateTime": "2025-01-10",
+          "location": {
+            "reference": "urn:uuid:55a5c5b1-4ec1-4d60-b4b2-ff5a84a41fd8"
+          },
+          "manufacturer": {
+            "display": "MODERNA BIOTECH SPAIN, S.L."
+          },
+          "lotNumber": "B1235742",
+          "performer": [
+            {
+              "actor": {
+                "reference": "urn:uuid:45a5c5b1-4ec1-4d60-b4b2-ff5a84a41fd7",
+                "display": "Ospedale Careggi - Firenze"
+              }
+            },
+            {
+              "actor": {
+                "reference": "urn:uuid:d7a490a1-d267-4785-ac98-db56748827fb"
+              }
+            }
+          ],
+          "protocolApplied": [
+            {
+              "targetDisease": [
+                {
+                  "coding": [
+                    {
+                      "system": "http://hl7.org/fhir/sid/icd-10",
+                      "code": "J12.82",
+                      "display": "Pneumonia due to coronavirus disease 2019"
+                    }
+                  ]
+                }
+              ],
+              "doseNumberPositiveInt": 1,
+              "seriesDosesPositiveInt": 2
+            }
+          ]
+        }
+      },
+      {
+        "fullUrl": "urn:uuid:55a5c5b1-4ec1-4d60-b4b2-ff5a84a41fd8",
+        "resource": {
+          "resourceType": "Location",
+          "id": "55a5c5b1-4ec1-4d60-b4b2-ff5a84a41fd8",
+          "text": {
+            "status": "generated",
+            "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><p><b>Generated Narrative</b></p><p><b>name</b>: AZ. OSPEDALIERO - UNIVERSITARIA CAREGGI</p><p><b>address</b>: Firenze IT </p></div>"
+          },
+          "name": "AZ. OSPEDALIERO - UNIVERSITARIA CAREGGI",
+          "address": {
+            "city": "Firenze",
+            "country": "IT"
+          }
+        }
+      }
+    ]
+  }
+}' -i
+```
+
+**Expected Response:** `202 Accepted`. After polling, a successful response confirms that the patient's Unified Health Index has been updated with the new entry, allowing any other authorized provider to discover this new piece of health information.
+
+---
