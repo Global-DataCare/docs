@@ -53,6 +53,45 @@ After an organization registers with the gateway's host, it will operate under o
     -   **`did:web` Example:** `did:web:connector.host.com:acme-hospital:cds-es:v1:health-care`
     -   **Endpoint Base:** `https://connector.host.com/acme-hospital/cds-es/v1/health-care/`
 
+## ICA-Signed X.509 for Tenant Connectors
+
+This platform requires **tenant connectors** to hold an **ICA-signed X.509 certificate** while **private keys stay local** in the tenant's connector service.
+
+The ICA signs a CSR, and the signed certificate is then attached to the tenant’s public metadata (JWK/DID/x509 endpoint).
+
+**Goals**
+- Private key never leaves the tenant environment.
+- ICA only signs a CSR after host verification.
+- X.509 chain is publishable and auditable.
+
+**High-level steps**
+1. **Key pair & CSR (tenant/gwtemplate):**  
+   The tenant generates a key pair locally and creates a CSR (PKCS#10) with:
+   - `CN = alternateName` (service name, e.g., “UNID - Europe Operator (Test)”)
+   - `SANs = tenant connector domains/subdomains`
+   - `OID 2.5.4.97 (organizationIdentifier) = TAX<country>-<taxId>`
+2. **Signed request to host:**  
+   The tenant submits the CSR plus its `schema.org Organization` JSON, signed with the private key to prove possession.
+3. **Host validation:**  
+   The host verifies schema.org fields, tax/country, CSR signature, and contractual acceptance.
+4. **ICA signing (host → ICA):**  
+   The host uses the ICA to sign the CSR and obtains the **public X.509 certificate** (chain).
+5. **Publish & bind:**  
+   The tenant publishes:
+   - `/.well-known/x509.json` (or your public x509 endpoint)  
+   - `jwks.json` with **`x5c`** (base64 DER chain) and optional `x5t#S256`  
+   - DID document references the JWK (with `x5c`) and the x509 endpoint
+
+**Why CN = alternateName**
+- CN identifies the **service** (CA/ICA/HOST/PROVIDER), not the legal entity.  
+- `legalName` remains the legal organization name; `name` is transliterated.
+
+**Why hybrid cryptography is implemented now (not as a future option)**
+- **Gaia-X ICAM 25.11 compatibility:** `publicKeyJwk` must include `x5c` or `x5u`, and `alg` must be specified with an RFC7518-compliant value.
+- **Operational interoperability:** maintain compatibility with SMART-on-FHIR/OIDC runtimes and PKI/X.509 ecosystems used in Hyperledger Fabric and Pontus-X.
+- **Long-retention security:** protect sensitive records against “store now, decrypt later” risk for long-term data storage.
+- **Frontend migration horizon:** support replacement of current frontend apps with next-generation clients before 2030, as recommended by multiple security agencies.
+
 
 ---
 
@@ -114,6 +153,57 @@ For a client to trust the gateway, it must first discover its capabilities and p
 -   `/.well-known/smart-configuration`: The discovery document for SMART on FHIR.
 -   `/.well-known/fhir/capabilitystatement`: The standard discovery document for HL7 FHIR API capabilities.
 -   `/.well-known/self-description.json`: The entity's GAIA-X Self-Description Verifiable Credential.
+-   `/.well-known/legal-participant.vc.json`: The GAIA-X Legal Participant VC (ICA-attested when available).
+-   `/.well-known/vc.json`: Legacy alias for the legal participant VC.
+-   `/.well-known/openid-credential-issuer`: OIDC4VCI metadata (compliance VC issuance).
+
+### 3.6. OIDC4VCI Compliance VC Issuance
+
+-   **Endpoint:** `POST /:tenantId/cds-:jurisdiction/v1/:sector/identity/oidc/credential`
+-   **Description:** Issues a Gaia-X Legal Participant VC as a compliance credential (OIDC4VCI-style). Requires a Bearer access_token.
+
+### 3.7. Public `serviceId` Conventions (DID Document)
+
+For API integrators, the only relevant source is the **published DID Document** (`.well-known/did.json`).
+
+Use `didDocument.service[].id` as the canonical endpoint capability identifier:
+
+- Action-style API capabilities typically appear as:
+  `did:web:<domain>#<section>:<format>:<resourceType>:<action>`
+- Example:
+  `did:web:api.acme.org#identity:openid:License:_issue`
+
+Path-to-serviceId example (management endpoint):
+- Endpoint path:
+  `POST /{tenantId}/cds-{jurisdiction}/v1/{sector}/identity/openid/License/_issue`
+- DID `serviceId` target for delegation/authorization:
+  `did:web:api.acme.org#identity:openid:License:_issue`
+
+Notes for clients:
+- Treat `did.json` as the public source of truth.
+- Some discovery services (for example DCAT catalog/discovery) may use explicit service entries instead of an action-style suffix.
+
+### 3.8. Management Authorization Model (Controller + ODRL Delegation)
+
+For management endpoints (for example `identity/openid/License/_issue`), the recommended security model is:
+
+1. Validate secure DIDComm envelope and JWS signature.
+2. Resolve signer actor from JWS metadata (`kid`) against tenant-registered employee/device keys.
+3. Authorize with one of:
+   - actor is a tenant **controller**, or
+   - actor has an active **delegation policy** for that endpoint capability.
+
+Delegation model:
+- Policy language: **ODRL**.
+- Atomic permission target: endpoint capability (`didDocument.service[].id`), for example
+  `did:web:...#identity:openid:License:_issue`.
+- Optional constraints for tighter control: `email`, `role`, and specific `kid` (device-bound delegation),
+  validity window (`nbf`/`exp`), and revocation status.
+
+Current implementation status (February 16, 2026):
+- Secure flow (`application/x-www-form-urlencoded`) already verifies JWS and resolves sender keys.
+- Fine-grained controller/delegation authorization for management endpoints is a pending hardening task.
+- Plaintext/demo mode is intentionally more permissive and must not be used as production security posture.
 
 
 ## 4. Interaction Modes
@@ -160,6 +250,52 @@ The plaintext of a JWE/DIDComm message is a JSON object containing the following
 | `response_mode`   | `string` | No        | **Response Protocol:** Specifies the format of the JARM response itself.                                                                 |
 | `body`            | `object` | **Yes**   | **Business Payload:** The content of the request, structured according to the `type` field.                                              |
 
+`jti` uniqueness note:
+- Best practice (FAPI/JWT): `jti` should be unique per request to support replay protection.
+- Current implementation status (February 16, 2026): replay protection is available as a pluggable provider.
+  - `REPLAY_PROTECTION_PROVIDER=none` (default): disabled
+  - `REPLAY_PROTECTION_PROVIDER=mem`: enabled in-memory cache (`<vaultId>:<iss>:<jti>`, TTL from `exp`)
+  - `REPLAY_PROTECTION_PROVIDER=redis`: distributed cache using Redis `SET NX EX` (recommended for development/production)
+  - Replay scope keying:
+    - host endpoints: `vaultId = host`
+    - tenant endpoints: `vaultId = <sector>_<tenantId>`
+- Swagger `/api-docs` helper: use `Global Flow Context -> test id` (e.g., `01`, `02`) to auto-suffix template `jti/thid` values and avoid collisions across repeated test runs.
+
+### 5.1. Swagger `/api-docs` Global Flow Context (Demo Helper)
+
+The floating **Global Flow Context** panel is a Swagger UI helper only (demo/testing convenience).
+It does **not** change backend defaults or server-side validation rules.
+
+Default values when `/api-docs` is opened:
+- `test id`: timestamp (`YYYYMMDDHHmmss`)
+- `tenantId`: `acme`
+- `jurisdiction`: `ES`
+- `sector`: `health-care`
+- `network type` (host sector): `test`
+- `tax id`: `TaxNumber-<tenantId>` (example: `TaxNumber-acme`)
+
+What is auto-applied at request execution time:
+- Path params: `tenantId`, `jurisdiction`, `sector`
+- Placeholders in request bodies:
+  `{{testId}}`, `{{id}}`, `<test-id>`, `{{tenantId}}`, `{{taxId}}`, `{{sector}}`, `{{offerId}}`,
+  `{{activationCode}}`, `{{licenseId}}`
+- Template IDs: `jti`/`thid` values ending in `-id`/`-thread-id` are suffixed with `-<test-id>`
+- Known claim overrides:
+  - tenant alternate name
+  - tax identifier value
+  - service category
+  - accepted offer identifier
+  - `subject_token` in token exchange
+
+Auto-filled from previous successful responses:
+- `offerId` from `org.schema.Offer.identifier`
+- `activationCode` from `org.schema.IndividualProduct.serialNumber`
+- `licenseId` from the first value in `org.schema.Offer.serialNumber`
+
+Troubleshooting:
+- Swagger examples may still visually show `acme` in the schema/example panel, but the request URL/body is rewritten with the panel values when you click `Execute`.
+- A `404 not-found` on tenant endpoints usually means the executed path still points to a tenant/sector/jurisdiction that does not exist.
+
 
 ---
 
@@ -169,7 +305,19 @@ This section details the secure workflow for registering a new organization. The
 
 Onboarding a new organization involves registering its legal information, creating a self-issued verifiable credential, generating a DID Document for its API connector, and verifying the legal information to obtain a verifiable presentation signed by a government entity. This final step is required for production network access.
 
--   For `host-level` operations related to the network (e.g., registering a new tenant), the `:sector` is `test`. This will evolve to `test-network` and `network` to manage access to the underlying blockchain ledger.
+-   For `host-level` onboarding operations (registering a new tenant on the host), the `:sector` is a **network environment selector**:
+    - `demo` / `test` → `test` (no blockchain integration; MVP/in-memory)
+    - `development` / `staging` → `test-network` (blockchain test network)
+    - `production` → `network` (blockchain production network)
+
+**Current test-network policy:**  
+When `section = test-network`, the host requests certificate issuance from the
+**test ICA** and binds the tenant to the **test blockchain namespace**.  
+Production enrollment is not enabled yet.
+
+Mapping:
+- ICA: `test-eur-ica.unid.online`
+- Kubernetes namespace: `test-fabric-v3`
 
 HTTP requests must include the following headers:
 
@@ -178,9 +326,30 @@ HTTP requests must include the following headers:
 -   `Authorization: Bearer` (mandatory): An `id_token` for organization registration and order endpoints, and a `smart-access-token` for subsequent requests.
 -   `Platform-Version` (optional): Identifies the version of the intermediary server (for future use).
 
-The SMART flow uses the `scope` property as defined by the SMART-on-FHIR v2.0 specification.
+	The SMART flow uses the `scope` property as defined by the SMART-on-FHIR v2.0 specification.
+
+	**Jurisdiction meaning:** The `{jurisdiction}` segment is the jurisdiction code for the **provider/tenant** within the host-operated infrastructure (e.g., `ES` or `ES-CT`). It namespaces the CDS space and registry entries for that tenant under the host.
 
 For demonstration purposes, `Content-Type: application/didcomm-plaintext+json` (or `application/json`) is permitted. However, in production, all messages must be secured using the FAPI Security Profile (based on JAR and JARM), where `Content-Type: application/x-www-form-urlencoded` is used to submit and receive encrypted messages via the `request` and `response` form parameters.
+
+### Asynchronous jobs: submit vs poll (FAPI-style)
+
+Most business endpoints in this gateway are **asynchronous**:
+
+- **Submit** the job to an endpoint ending in `/_batch` (or another action). If the gateway can accept and enqueue the job, it returns `202 Accepted` with a `Location` header that points to the polling endpoint.
+- **Immediate errors:** if the gateway cannot accept the request (invalid payload, missing headers, unsupported `Content-Type`, auth failure, invalid path, etc.), it returns an error immediately (e.g., `400/401/404/415`) and no polling is needed.
+- **Poll** the result by calling the same URL and appending `-response` to the last path segment:
+  - Example: `.../Organization/_batch` → `.../Organization/_batch-response`
+  - Example: `.../identity/openid/Device/_dcr` → `.../identity/openid/Device/_dcr-response`
+  - Example: `.../identity/openid/smart/token` → `.../identity/openid/smart/token-response`
+- **Polling responses:**
+  - `202 Accepted` with `Retry-After` while the job is still `PENDING`.
+  - `200 OK` with the final result when the job is completed.
+  - `500` if the worker failed during processing (business/processing error).
+
+**Response format depends on the original submission flow:**
+- Legacy/plaintext submissions return a JSON body.
+- Secure submissions return `application/x-www-form-urlencoded` with `response=<jwe>`.
 
 The following documentation explains the flow for demonstration purposes.
 
@@ -189,7 +358,12 @@ The following documentation explains the flow for demonstration purposes.
 
 This is the first step for any new organization. A legally authorized representative submits an asynchronous job to the `host`, proving their identity via an OIDC `id_token` from a trusted provider (e.g., Google, Apple, eIDAS). The `id_token` serves as a verifiable assertion of the representative's identity, which is crucial for establishing the initial trust anchor for the new tenant.
 
-**Endpoint:** `POST /host/cds-{jurisdiction}/v1/test/registry/org.schema/Organization/_batch`
+**Endpoint:** `POST /host/cds-{jurisdiction}/v1/{sector}/registry/org.schema/Organization/_batch`
+
+**Routing note:** `jurisdiction` and `sector` are part of the host routing path.  
+- `jurisdiction` is used to resolve channel/ledger routing and tenant namespace.  
+- `sector` selects the onboarding network environment (`test`, `test-network`, `network`).  
+These are path parameters, not headers. Claims still carry the organization address country and identifiers.
 
 **`curl` Example:**
 ```bash
@@ -205,8 +379,8 @@ curl -X POST 'http://localhost:3000/host/cds-es/v1/test/registry/org.schema/Orga
 --header 'Authorization: Bearer [OIDC_ID_TOKEN_OF_LEGAL_REP]' \
 --header 'Content-Type: application/didcomm-plaintext+json' \
 --data '{
-  "jti": "org-registration-request-id",
-  "thid": "org-registration-thread-id",
+  "jti": "org-registration-request-<test-id>",
+  "thid": "org-registration-thread-<test-id>",
   "iss": "urn:ietf:rfc:7638:thumbprint-public-sig-key-device",
   "aud": "did:web:host.example.com",
   "exp": 1678886460,
@@ -230,7 +404,7 @@ curl -X POST 'http://localhost:3000/host/cds-es/v1/test/registry/org.schema/Orga
             "org.schema.Organization.numberOfEmployees.value": 2,
             "org.schema.Organization.url": "api.acme.org",
             "org.schema.Person.email": "admin1@acme.org",
-            "org.schema.Person.hasOccupation": "ISCO-08:1120",
+            "org.schema.Person.hasOccupation": "ISCO-08|1120",
             "org.schema.Service.category": "health-care",
             "org.schema.Service.identifier": "did:web:api-provider.example.com",
             "org.schema.Service.serviceType": "http://terminology.hl7.org/CodeSystem/v3-ActReason|SRVC",
@@ -243,30 +417,41 @@ curl -X POST 'http://localhost:3000/host/cds-es/v1/test/registry/org.schema/Orga
   "meta": {
     "jwe": {
       "header": {
+        "typ": "application/didcomm-encrypted+json",
+        "cty": "JWS",
+        "enc": "A256GCM",
+        "alg": "ML-KEM-768",
+        "kid": "thumbprint-public-enc-key-recipient",
+        "skid": "thumbprint-public-enc-key-device",
         "jwk": {
           "crv": "ML-KEM-768",
-          "kid": "thumbprint-enc-key",
           "kty": "OKP",
-          "use": "enc",
           "x": "base64url-public-enc-key-device"
         }
       }
     },
     "jws": {
       "protected": {
+        "typ": "application/didcomm-signed+json",
+        "cty": "application/didcomm-plaintext+json",
+        "alg": "ML-DSA-44",
+        "kid": "thumbprint-public-sig-key-device",
         "jwk": {
           "alg": "ML-DSA-44",
-          "kid": "thumbprint-sig-key-device",
           "kty": "AKP",
-          "pub": "base64url-public-sig-key",
-          "use": "sig"
+          "pub": "base64url-public-sig-key-device"
         }
       }
     }
   }
 }' -i
 ```
-**Note:** The `meta` object containing the JSON Web Keys (JWKs) is for demonstration purposes only. In production, messages are signed and encrypted, and the `jwk` property is required in the secure envelope (JWS and JWE/DIDComm) for the organization registration request.
+
+Testing note:
+- `org.schema.Organization.identifier.value` (Tax ID) participates in tenant collection naming and should be unique per organization registration.
+- For demo flows in `/api-docs`, keep it aligned with tenant context (default pattern: `TaxNumber-<tenantId>`).
+
+**Note:** In these examples, `meta.jwe.header.kid` is the recipient’s public encryption key identifier (resolved from the target DID Document / JWKS), while `meta.jwe.header.skid` is the sender’s public encryption key identifier (so the server can encrypt the async response back). The embedded `jwk` objects above intentionally omit `kid` and `use`. The canonical thumbprint material for ML-DSA / ML-KEM should only include the key parameters (`kty`, `alg`/`crv`, `pub`/`x`) to compute a deterministic RFC 7638 thumbprint. After the backend can resolve the device keys from an existing DID Document / JWKS (e.g., after DCR), subsequent requests can omit embedded `jwk` and only send `kid` / `skid`.
 
 **Expected Response (`202 Accepted`):**
 The server acknowledges the request immediately and provides a polling location.
@@ -280,7 +465,7 @@ Retry-After: 5
 
 To retrieve the result of the asynchronous registration job, the client sends a `POST` request to the `Location` URL provided in the `202 Accepted` response. This polling mechanism is a core part of the FAPI security profile, preventing long-held connections and improving system resilience.
 
-The polling request body contains the `thid` (thread ID) from the original request, allowing the server to correlate the poll with the correct job.
+The polling request body contains the `thid` (thread ID) from the original request, allowing the server to correlate the poll with the correct job. For the order step, this is the order thread ID (not the registration one).
 
 ```bash
 # Use the 'thid' from the original request body in the polling request.
@@ -290,7 +475,7 @@ curl -X POST 'http://localhost:3000/host/cds-es/v1/test/registry/org.schema/Orga
 --header 'App-Version: [APP-VERSION]' \
 --header 'Authorization: Bearer [OIDC_ID_TOKEN_OF_LEGAL_REP]' \
 --header 'Content-Type: application/x-www-form-urlencoded' \
---data-urlencode 'thid=org-registration-thread-id'
+--data-urlencode 'thid=org-registration-thread-<test-id>'
 ```
 
 *Polling retrieves the final outcome of the registration job. A successful response confirms the tenant has been created, while an error response will detail the failure.*
@@ -303,10 +488,10 @@ The `aud` (audience) of the backend's response is the public encryption key of t
 **Example Response:**
 ```json
 {
-  "jti": "org-registration-response-id",
-  "thid": "org-registration-thread-id",
+  "jti": "org-registration-response-<test-id>",
+  "thid": "org-registration-thread-<test-id>",
   "aud": "urn:ietf:rfc:7638:thumbprint-public-enc-key-device",
-  "iss": "did:web:host.example.com#v1_<network>_registry_org.schema_organization_batch",
+  "iss": "did:web:host.example.com",
   "exp": 1678886460,
   "iat": 1678886400,
   "nbf": 1678886400,
@@ -328,7 +513,7 @@ The `aud` (audience) of the backend's response is the public encryption key of t
             "org.schema.Organization.numberOfEmployees.value": 2,
             "org.schema.Organization.url": "api.acme.org",
             "org.schema.Person.email": "admin1@acme.org",
-            "org.schema.Person.hasOccupation": "ISCO-08:1120",
+            "org.schema.Person.hasOccupation": "ISCO-08|1120",
             "org.schema.Service.category": "health-care",
             "org.schema.Service.identifier": "did:web:api-provider.example.com",
             "org.schema.Service.serviceType": "http://terminology.hl7.org/CodeSystem/v3-ActReason|SRVC",
@@ -338,7 +523,7 @@ The `aud` (audience) of the backend's response is the public encryption key of t
             "org.schema.Offer.checkoutPageURLTemplate": "<payment-url>",
             "org.schema.Offer.eligibleCustomerType": "employee",
             "org.schema.Offer.eligibleQuantity.value": 2,
-            "org.schema.Offer.identifier": "urn:cds-<jurisdiction>:v1:<sector>:product:org.schema:Offer:<offer-uuid>",
+            "org.schema.Offer.identifier": "urn:cds:ES:v1:health-care:product:org.schema:Offer:3391176c-e2fa-4ec3-98c0-e945f82b8a42",
             "org.schema.Offer.itemOffered.name": "License Tier XS",
             "org.schema.Offer.itemOffered.sku": "web-or-app-identifier",
             "org.schema.Offer.offeredBy": "did:web:host.example.com",
@@ -352,6 +537,10 @@ The `aud` (audience) of the backend's response is the public encryption key of t
   }
 }
 ```
+
+Save `org.schema.Offer.identifier` from this response. You must reuse that exact value in Step 2 as
+`Order.acceptedOffer.identifier` (replace any placeholders in examples with the real Offer ID you
+received). Use the full URN returned in `org.schema.Offer.identifier`; UUID-only values are rejected.
 
 ### 6.2. Step 2: Confirm the Order for Registration
 
@@ -370,8 +559,8 @@ curl -X POST 'http://localhost:3000/host/cds-es/v1/test/registry/org.schema/Orde
 --header 'Content-Type: application/json' \
 --header 'Authorization: Bearer [OIDC_ID_TOKEN_OF_LEGAL_REP]' \
 --data '{
-  "jti": "org-order-request-id",
-  "thid": "org-order-thread-id",
+  "jti": "org-order-request-<test-id>",
+  "thid": "org-order-thread-<test-id>",
   "iss": "urn:ietf:rfc:7638:thumbprint-public-sig-key-device",
   "aud": "did:web:host.example.com",
   "exp": 1678886460,
@@ -385,8 +574,13 @@ curl -X POST 'http://localhost:3000/host/cds-es/v1/test/registry/org.schema/Orde
         "meta": {
           "claims": {
             "@context": "org.schema",
-            // This identifier MUST match the 'Offer.identifier' from the previous response.
-            "Order.acceptedOffer.identifier": "urn:cds-<jurisdiction>:v1:<sector>:product:org.schema:Offer:<offer-uuid>"
+            // Claim key normalization:
+            // - When '@context' is 'org.schema', the API will normalize any claim keys that don't start with 'org.schema.'
+            //   by prepending that prefix (e.g., 'Offer.identifier' -> 'org.schema.Offer.identifier').
+            // - Claims are stored in a canonical (alphabetical) key order to support future deterministic hashing.
+            //
+            // This identifier MUST match the Offer identifier from the previous response.
+            "Order.acceptedOffer.identifier": "urn:cds:ES:v1:health-care:product:org.schema:Offer:3391176c-e2fa-4ec3-98c0-e945f82b8a42"
           }
         }
       }
@@ -395,11 +589,19 @@ curl -X POST 'http://localhost:3000/host/cds-es/v1/test/registry/org.schema/Orde
   "meta": {
     "jwe": {
       "header": {
-        "kid": "thumbprint-public-enc-key-device"
+        "typ": "application/didcomm-encrypted+json",
+        "cty": "JWS",
+        "enc": "A256GCM",
+        "alg": "ML-KEM-768",
+        "kid": "thumbprint-public-enc-key-recipient",
+        "skid": "thumbprint-public-enc-key-device"
       }
     },
     "jws": {
       "protected": {
+        "typ": "application/didcomm-signed+json",
+        "cty": "application/didcomm-plaintext+json",
+        "alg": "ML-DSA-44",
         "kid": "thumbprint-public-sig-key-device"
       }
     }
@@ -407,7 +609,7 @@ curl -X POST 'http://localhost:3000/host/cds-es/v1/test/registry/org.schema/Orde
 }' -i
 ```
 
-**Note:** As previously explained, the `meta` object is for demonstration purposes. The secure envelope in production MUST include the `kid` and `skid` properties.
+**Note:** As previously explained, the secure envelope in production MUST include the recipient `kid` (the target public encryption key resolved from the destination DID Document / JWKS) and the sender `skid` (so the server can encrypt the async response back). For most calls after device registration, the client does not need to resend its embedded `jwk`.
 
 **Example Expected Response (`202 Accepted`):**
 The server acknowledges the order request and provides a new polling location for the order status.
@@ -417,34 +619,103 @@ Location: http://localhost:3000/host/cds-es/v1/test/registry/org.schema/Order/_b
 Retry-After: 5
 ```
 
-The backend creates a checkout session with the payment gateway, which returns a payment page URL in the response.
+The backend creates a payment session based on configuration:
+- `INVOICE_PROVIDER=stripe` + `INVOICE_FLOW=pre` creates a Stripe invoice and returns `hosted_invoice_url`.
+- `INVOICE_PROVIDER=internal` generates an internal invoice record and (optionally) uses a separate payment provider.
+If Stripe is not configured or the price is zero, the payment URL may be an empty string.
+
+**Invoice format note:** At present the response only surfaces Stripe invoice identifiers/URLs (`Order.partOfInvoice`,
+`Order.paymentUrl`). No UBL or PDF invoice is generated by the gateway yet. Spain’s **VeriFactu** is a national
+anti-fraud system (AEAT) and is **not** based on UBL; it requires a separate compliant implementation. UBL/Peppol
+output will be added in a future invoice module.
+
+### 6.3. Step 3: Retrieve ICA Enrollment Status (Message)
+
+After the Order is accepted, the ICA may return an **asynchronous** enrollment response.
+In demo mode (`ICA_AUTO_APPROVE=true`) the message can appear immediately. Otherwise,
+poll for it using the messaging endpoints.
+
+**Endpoint:**  
+`POST /{tenantId}/cds-{jurisdiction}/v1/{sector}/messaging/{format}/{resourceType}/_messages`
+
+**Expected message type:** `IcaEnrollResponse-v1.0`  
+**Payload:** `resource` = `IcaEnrollmentResult` (certificate + chain)
+
+**Routing note:** The host orchestrates ICA enrollment, but the resulting user-facing notification is delivered in the
+tenant messaging domain and should be queried through the tenant route/sector.
+
+**Example (list messages):**
+```bash
+curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/messaging/post-quantum/didcomm-plaintext/_messages' \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer demo' \
+  --data '{"thid":"thid-ica-status"}'
+```
+
+### 6.4. Licensing and Settlement Model (Conceptual)
+
+The onboarding `Offer/Order` in Section 6 is strictly about creating the **tenant account** on the host (registry entry + DID + initial test-network enablement). After the tenant account exists, **license purchases** become a separate business flow.
+
+- **Employee licenses (B2B):** License purchase always happens on a **host endpoint**. The host acts as the commercial intermediary and will later settle royalties/fees per license with the governing organization (and potentially other parties).
+- **Family/individual licenses (B2C):** The **provider (tenant)** invoices its customers. The tenant still settles royalties/fees back to the host, and the host settles onwards to the governing organization.
+
+As a result:
+- Organization registration “ends” when the registration `Order` is accepted.
+- License registration “starts” when a dedicated **license purchase `Order`** is submitted (followed by payment gateway confirmation and license activation).
+
+Operationally (target architecture), the host maintains a dedicated **`licenses` registry** (offers, orders, payment transactions, and activation state). This registry is designed to be auditable and may be exposed and/or notified to a governing body. In the final deployment, this host registry is expected to be anchored to a blockchain adapter where the host signs transactions with its own certificate against a colocated peer; device `did:web` + `jwks` bindings may also be recorded per license during activation.
+
+**Current implementation note:** The codebase currently implements **seat gating** using the tenant vault section **`device-licenses`** (a pool of `DeviceLicense` documents stored under the tenant's vault/collection via the vault repository abstraction). The public “license purchase” host endpoints and the auditable host-level `licenses` registry are **not wired yet**; `LicenseManager` exists as an internal job processor for generating `device-licenses` documents.
 
 **Example Polling for Organization's Order Response:**
 Polling the new `-response` endpoint retrieves the outcome of the order submission.
 ```bash
 # Use the 'thid' from the order request body in the polling request.
-curl -X POST 'http://localhost:3000/host/cds-es/v1/test/registry/org.schema/Organization/_batch-response' \
+curl -X POST 'http://localhost:3000/host/cds-es/v1/test/registry/org.schema/Order/_batch-response' \
 --header 'App-ID: [APP-ID]' \
 --header 'App-Version: [APP-VERSION]' \
 --header 'Authorization: Bearer [OIDC_ID_TOKEN_OF_LEGAL_REP]' \
 --header 'Content-Type: application/x-www-form-urlencoded' \
---data-urlencode 'thid=org-order-thread-id'
+--data-urlencode 'thid=org-order-thread-<test-id>'
 ```
 
-**Example Response with Payment URL:**
-A successful response contains the URL for the payment gateway. The user must be redirected to this URL to complete the payment and finalize the registration.
+**Example Response with Order Invoice Bundle:**
+A successful response returns a bundle with an `Organization-order-response-v1.0` entry that includes the payment
+link and invoice reference. The client should redirect the user to `Order.paymentUrl` when present.
 ```json
 {
-  "jti": "org-order-response-id",
-  "thid": "org-order-thread-id",
+  "jti": "org-order-response-<test-id>",
+  "thid": "org-order-thread-<test-id>",
   "aud": "urn:ietf:rfc:7638:thumbprint-public-enc-key-device",
   "iss": "did:web:host.example.com",
   "exp": 1678886460,
   "iat": 1678886400,
-  "nbf": 1678886400,  
+  "nbf": 1678886400,
   "type": "application/json",
   "body": {
-    "url": "<payment-url>"
+    "resourceType": "Bundle",
+    "type": "batch-response",
+    "total": 1,
+    "data": [
+      {
+        "type": "Organization-order-response-v1.0",
+        "meta": {
+          "claims": {
+            "@context": "org.schema",
+            "@type": "Order:Invoice",
+            "Order.acceptedOffer.identifier": "urn:cds:ES:v1:health-care:product:org.schema:Offer:<offer-uuid>",
+            "Order.partOfInvoice": "<invoice-id-or-url>",
+            "Order.paymentMethod": "Stripe",
+            "Order.paymentDueDate": "2025-10-22T14:30:00Z",
+            "Order.paymentUrl": "<payment-url>",
+            "Order.invoiceIssuedAt": "2025-10-15T14:30:00Z",
+            "org.schema.IndividualProduct.serialNumber": "lic-activation-code-001",
+            "org.schema.IndividualProduct.category": "professional"
+          }
+        },
+        "response": { "status": "201" }
+      }
+    ]
   }
 }
 ```
@@ -462,7 +733,7 @@ The `:sector` parameter in the URL path has a specific meaning:
 
 -   For tenant-specific operations (like creating an employee or customer), the `:sector` is the tenant's own operational sector (e.g., `health-care`, `health-insurance`).
 
-For demo purposes is allowed to use `Content-Type: application/didcomm-plaintext+json` (or just `Content-Type: application/json` for brevity) in the HTTP Header, but in production the requisite is to enable secure DIDComm messages using the FAPI Security Profile (based on JAR and JARM), where `Content-Type: application/x-www-form-urlencoded` enables the `request` and `response` form parameters to submit and receive the encrypted messages.
+For demo purposes, use `Content-Type: application/didcomm-plaintext+json` in the HTTP Header. In production the requisite is to enable secure DIDComm messages using the FAPI Security Profile (based on JAR and JARM), where `Content-Type: application/x-www-form-urlencoded` enables the `request` and `response` form parameters to submit and receive the encrypted messages.
 
 The following documentation explains the flow for demo purposes.
 
@@ -474,7 +745,238 @@ This single, atomic transaction accomplishes two fundamental goals:
 
 This process securely links the user's traditional identity credential (an OIDC `id_token`) to their new decentralized identity. The server validates all inputs, consumes the license, generates the `client_id` (`did:web`), and permanently stores the device's public keys.
 
-Traditionally, the Dynamic Client Registration endpoint requires an `initial_access_token`. In this implementation, that PKCE flow is replaced: authorization is achieved by combining a pre-purchased license `code` with the user's `id_token` (from a trusted provider like Google, Apple, or eIDAS). The email used to get the `id_token` MUST match the email registered for the user.
+Traditionally, the Dynamic Client Registration endpoint requires an `initial access_token`. In this implementation we keep that concept, but we obtain it from the host via a short-lived exchange that requires:
+
+1. A valid **user identity** token (normalized to a Firebase `id_token`), and
+2. A pre-purchased license **activation code** (`subject_token`).
+
+If the user starts from an external identity provider (e.g. eIDAS), the recommended flow is to first federate it into Firebase (custom token → Firebase ID token), and then perform the exchange below.
+
+#### 7.1.1. (Optional) Federate external identity into Firebase
+
+This step is **only required if the client does not already have a Firebase `id_token`**.
+
+- If your app authenticates users with Firebase Auth / Identity Platform (including Google/Apple/eIDAS as federated providers configured in Firebase), then you already obtain a **Firebase `id_token`** and you can skip this step.
+- If your app starts from an external OIDC provider **outside** Firebase (e.g., a standalone eIDAS OIDC flow), then you must first federate it into Firebase (provider `id_token` → Firebase `custom_token` → Firebase `id_token`) and then proceed with `Token/_exchange`.
+
+**Why Firebase here?** This gateway normalizes end-user identity to a single token format (Firebase `id_token`) so the backend does not need to implement and maintain verifier logic for every upstream identity provider. Firebase/Identity Platform acts as the identity broker and policy enforcement point (issuer trust, key rotation, session rules), while the gateway focuses on DIDComm, licenses, and authorization logic.
+
+This endpoint is always DIDComm (plaintext in demo, encrypted in production).
+
+**Endpoint:** `POST /{tenantId}/cds-{jurisdiction}/v1/{sector}/identity/firebase/Token/_custom`
+
+- Header: `Content-Type: application/didcomm-plaintext+json`
+
+```json
+{
+  "jti": "federation-request-<test-id>",
+  "thid": "federation-thread-<test-id>",
+  "iss": "did:web:api.acme.org:employee:<email>:ISCO-08|<code>:device:<uuid>",
+  "aud": "did:web:api.acme.org#identity:firebase:token:_custom",
+  "exp": 1678886460,
+  "iat": 1678886400,
+  "nbf": 1678886400,
+  "type": "application/json",
+  "body": {
+    "provider": "eidas",
+    "id_token": "<oidc_id_token_from_provider>"
+  }
+}
+```
+
+**Submit Response (`202 Accepted`):**
+
+```http
+HTTP/1.1 202 Accepted
+Location: http://localhost:3000/acme/cds-es/v1/health-care/identity/firebase/Token/_custom-response
+Retry-After: 5
+```
+
+**Polling for Federation Result:**
+
+```bash
+curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/identity/firebase/Token/_custom-response' \
+--header 'App-ID: [APP-ID]' \
+--header 'App-Version: [APP-VERSION]' \
+--header 'Content-Type: application/json' \
+--data '{
+  "thid": "federation-thread-<test-id>"
+}' -i
+```
+
+**Example Poll Response Body (`200 OK`):**
+
+```json
+{
+  "firebase_custom_token": "<firebase_custom_token>",
+  "provider": "eidas",
+  "subject": "<provider_subject>",
+  "email": "<optional>"
+}
+```
+
+The client app then exchanges `firebase_custom_token` for a Firebase `id_token` via `signInWithCustomToken` (client-side).
+
+#### 7.1.1.a Issue (Reserve) a License Activation Code (Tenant Admin / IT)
+
+`Token/_exchange` requires a **single-use license activation code** (`subject_token`). In the current implementation, licenses live in the tenant vault section `device-licenses` and are created as `available` seats after purchase (e.g., `userClass=employee` for professionals, `userClass=individual` for members of a family organization). The `Offer.serialNumber` list represents **seat IDs** (the pool), not activation codes.
+
+To invite a professional (or reserve a seat for a specific email + role), a tenant controller (or an IT employee with delegated permissions) issues an activation code from that pool. A single seat can issue multiple activation codes for different device profiles (e.g., mobile + web).
+
+**License types (seat policies):**
+- **User license (multi-device):** A seat represents a user entitlement. The same seat can issue multiple activation codes, one per device profile (e.g., mobile + web).
+- **Device license (single-device):** A seat represents a specific device entitlement. Only one activation code is issued for that seat. Additional devices require additional seats.
+
+**Automatic first activation code (controller devices):**
+- After a tenant registration `Order` is accepted, the backend auto-issues the **first** activation code for the **tenant legal representative** and returns it inside the Order response claims:
+  - `org.schema.IndividualProduct.serialNumber` (the activation code)
+  - `org.schema.IndividualProduct.category = "professional"` (disambiguation)
+- After a family registration `Order` is accepted, the backend auto-issues the **first** activation code for the **family controller** and returns it inside the Order response claims:
+  - `org.schema.IndividualProduct.serialNumber` (the activation code)
+  - `org.schema.IndividualProduct.category = "individual"` (disambiguation)
+- `License/_issue` remains the mechanism for issuing additional invitations (employees, additional family members, devices, etc.).
+
+**Current implementation note:** The first activation code is issued at Order finalization (before payment webhook confirmation). When Stripe is fully wired, this will move to the post-payment path (webhook or invoice paid event). Seat IDs from `Offer.serialNumber` are not themselves activation codes.
+
+**Operational guidance:** The legal representative does not need a manual invite (`License/_issue`) for their first device. All other employees (or additional family members) require an activation code issued from the pool.
+
+**Endpoint:** `POST /{tenantId}/cds-{jurisdiction}/v1/{sector}/identity/openid/License/_issue`
+
+```json
+{
+  "jti": "license-issue-request-<test-id>",
+  "thid": "license-issue-thread-<test-id>",
+  "iss": "did:web:api.acme.org:employee:admin1@acme.org:device:<uuid>",
+  "aud": "did:web:api.acme.org#identity:openid:license:_issue",
+  "type": "application/api+json",
+  "body": {
+    "resourceType": "Bundle",
+    "type": "batch",
+    "data": [{
+      "type": "EmployeeLicenseInvitation-v1.0",
+      "meta": {
+        "claims": {
+          "@context": "org.schema",
+          "org.schema.Person.email": "doctor1@acme.org",
+          "org.schema.Person.hasOccupation": "ISCO-08|2211",
+          "org.schema.IndividualProduct.category": "professional",
+          "org.schema.IndividualProduct.additionalType": "mobile"
+        }
+      }
+    }]
+  }
+}
+```
+
+Example for an already existing employee/legal representative (same endpoint, different email/role context):
+
+```json
+{
+  "jti": "license-issue-request-<test-id>-existing-employee",
+  "thid": "license-issue-thread-<test-id>-existing-employee",
+  "iss": "did:web:api.acme.org:employee:admin1@acme.org:device:<uuid>",
+  "aud": "did:web:api.acme.org#identity:openid:license:_issue",
+  "type": "application/api+json",
+  "body": {
+    "resourceType": "Bundle",
+    "type": "batch",
+    "data": [{
+      "type": "EmployeeLicenseInvitation-v1.0",
+      "meta": {
+        "claims": {
+          "@context": "org.schema",
+          "org.schema.Person.email": "admin1@acme.org",
+          "org.schema.Person.hasOccupation": "ISCO-08|1120",
+          "org.schema.IndividualProduct.category": "professional",
+          "org.schema.IndividualProduct.additionalType": "mobile"
+        }
+      }
+    }]
+  }
+}
+```
+
+**Response:** `batch-response` where the issued activation code is returned as `body.data[0].id` for copy/paste (email/QR delivery is out of scope for demo).
+
+**Bootstrap vs Hybrid SMART (important):**
+- **Bootstrap SMART (no VC yet):** The first SMART token can be obtained using only the external `id_token`
+  + activation code. This is required because the employee/family VC does not exist yet.
+- **Hybrid SMART (with Gaia-X VP):** After the employee/family VC is issued, subsequent SMART tokens should
+  include the VP (OIDC4VP) so the clearing house can verify revocation and return a short-lived VC JWT.
+- **Legal representative shortcut:** For the organization legal representative, the employee record is created
+  automatically during registration, so the bootstrap path is already satisfied. The VC still needs to be issued
+  after DCR, then hybrid SMART applies.
+- **Family controller shortcut:** For family registration, the controller (individual) is created automatically,
+  so the same bootstrap logic applies before issuing the family VC and switching to hybrid SMART.
+
+#### 7.1.2. Initial Access Token Exchange (for DCR)
+
+Traditionally, the Dynamic Client Registration endpoint requires an `initial_access_token`. In this implementation we keep that concept, but we obtain it via a short-lived exchange that requires:
+
+1. A valid **user identity** token (normalized to a Firebase `id_token`), and
+2. A pre-purchased license **activation code** (`subject_token`).
+
+This endpoint is always DIDComm (plaintext in demo, encrypted in production).
+
+**Endpoint:** `POST /{tenantId}/cds-{jurisdiction}/v1/{sector}/identity/openid/Token/_exchange`
+
+- Header: `Authorization: Bearer <firebase_id_token>`
+- Header: `Content-Type: application/didcomm-plaintext+json`
+
+Important:
+- `Authorization` must carry a valid JWT identity token (`firebase id_token` in current profile).
+- `body.subject_token` must carry the license activation code.
+- If you send an activation code where a JWT is expected, the backend returns an error such as
+  `ID token is invalid: Token is not a valid JWT format.`
+
+```json
+{
+  "jti": "token-exchange-request-<test-id>",
+  "thid": "token-exchange-thread-<test-id>",
+  "iss": "urn:ietf:rfc:7638:thumbprint-public-sig-key-device",
+  "aud": "did:web:api.acme.org#identity:openid:token:_exchange",
+  "exp": 1678886460,
+  "iat": 1678886400,
+  "nbf": 1678886400,
+  "type": "application/json",
+  "body": {
+    "subject_token": "lic-activation-code-001"
+  }
+}
+```
+
+`subject_token` must be a JSON string (quoted). Example invalid JSON: `"subject_token": lic-activation-code-001`.
+
+**Submit Response (`202 Accepted`):**
+
+```http
+HTTP/1.1 202 Accepted
+Location: http://localhost:3000/acme/cds-es/v1/health-care/identity/openid/Token/_exchange-response
+Retry-After: 5
+```
+
+**Polling for Token Exchange Result:**
+
+```bash
+curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/identity/openid/Token/_exchange-response' \
+--header 'App-ID: [APP-ID]' \
+--header 'App-Version: [APP-VERSION]' \
+--header 'Content-Type: application/json' \
+--data '{
+  "thid": "token-exchange-thread-<test-id>"
+}' -i
+```
+
+**Example Poll Response Body (`200 OK`):**
+
+```json
+{
+  "initial_access_token": "<jwt>",
+  "token_type": "Bearer",
+  "expires_in": 60,
+  "scope": "dcr:register"
+}
+```
 
 **Endpoint:** `POST /{tenantId}/cds-{jurisdiction}/v1/{sector}/identity/openid/Device/_dcr`
 
@@ -482,10 +984,10 @@ Below is the **plaintext content** of the DIDComm message.
 
 ```json
 {
-  "jti": "device-registration-request-id",
-  "thid": "device-registration-thread-id",
+  "jti": "device-registration-request-<test-id>",
+  "thid": "device-registration-thread-<test-id>",
   "iss": "urn:ietf:rfc:7638:thumbprint-public-sig-key-device",
-  "aud": "did:web:api.acme.org#identity_openid_device_dcr",
+  "aud": "did:web:api.acme.org#identity:openid:device:_dcr",
   "exp": 1678886460,
   "iat": 1678886400,
   "nbf": 1678886400,
@@ -504,7 +1006,7 @@ Below is the **plaintext content** of the DIDComm message.
       "push_provider": "expo",
       "push_token": "ExponentPushToken[xxxxxxxxxxxxxxxxxxxxxx]"
     },
-    "jwks_uri": "did:web:api.acme.org:employee:<email-address>:isco-08:<role-value>",
+    "jwks_uri": "did:web:api.acme.org:employee:<email-address>:ISCO-08|<code>",
     "jwks": {
       "keys": [
         {
@@ -550,29 +1052,103 @@ curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/identity/openid/D
 --header 'App-Version: [APP-VERSION]' \
 --header 'Authorization: Bearer [OIDC_ID_TOKEN]' \
 --header 'Content-Type: application/x-www-form-urlencoded'  \
---data-urlencode 'thid=device-registration-thread-id'
+--data-urlencode 'thid=device-registration-thread-<test-id>'
 ```
 
-**Example: Response with the `client_id`**
-The final response contains the newly created `client_id`, which is the official `did:web` identifier for this device.
+**Example: Response with the `client_id` (Bundle)**
+The final response includes a Bundle entry with a `Device` resource. The `client_id`
+is the official `did:web` identifier for this device. The response also includes
+schema.org `SoftwareApplication` claims for consistent indexing.
 
 ```json
 {
-  "jti": "device-registration-response-id",
-  "thid": "device-registration-thread-id",
-  "aud": "urn:ietf:rfc:7638:thumbprint-public-enc-key-device",
-  "iss": "did:web:api.acme.org",
-  "exp": 1678886460,
-  "iat": 1678886400,
-  "nbf": 1678886400,  
-  "type": "application/json",
-  "body": {
-   "client_id": "did:web:api.acme.org:employee:admin1@acme.org:device:<uuid>"
-  }
+  "resourceType": "Bundle",
+  "type": "batch-response",
+  "data": [
+    {
+      "type": "application/json",
+      "meta": {
+        "claims": {
+          "@context": "org.schema",
+          "@type": "SoftwareApplication",
+          "org.schema.SoftwareApplication.identifier": "<client_id>",
+          "org.schema.SoftwareApplication.name": "App for [email] as [role] on [iOS, Android, Web]",
+          "org.schema.SoftwareApplication.description": "Registered on device: User's iPhone 15 Pro"
+        }
+      },
+      "response": { "status": "201" },
+      "resource": {
+        "resourceType": "Device",
+        "id": "<client_id>",
+        "client_id": "<client_id>",
+        "client_id_issued_at": 1678886460,
+        "client_secret_expires_at": 0,
+        "registration_client_uri": "http://localhost:3000/clients/<client_id>"
+      }
+    }
+  ]
 }
 ```
 
 With a registered `client_id`, the application can now request scoped `access_token`s to perform actions.
+
+#### 7.1.3 Device Search (admin listing)
+
+Legal representatives and delegated IT roles can list registered devices for their tenant or hosted family organization.
+This returns a Bundle whose entries mirror the DCR response shape (`resourceType: "Device"`, plus `SoftwareApplication` claims).
+
+**Endpoint:** `POST /{tenantId}/cds-{jurisdiction}/v1/{sector}/identity/openid/Device/_search`
+
+**Example: Request (plaintext DIDComm)**
+```json
+{
+  "jti": "device-search-request-<test-id>",
+  "thid": "device-search-thread-<test-id>",
+  "iss": "did:web:api.acme.org:employee:admin1@acme.org:device:<uuid>",
+  "aud": "did:web:api.acme.org#identity:openid:device:_search",
+  "exp": 1678886460,
+  "iat": 1678886400,
+  "nbf": 1678886400,
+  "type": "application/json",
+  "body": {
+    "resourceType": "Device",
+    "type": "searchset"
+  }
+}
+```
+
+**Example: Poll Response (`200 OK`)**
+```json
+{
+  "resourceType": "Bundle",
+  "type": "batch-response",
+  "data": [
+    {
+      "type": "Device:Registered",
+      "meta": {
+        "claims": {
+          "@context": "org.schema",
+          "@type": "SoftwareApplication",
+          "org.schema.SoftwareApplication.identifier": "<client_id>"
+        }
+      },
+      "response": { "status": "200" },
+      "resource": {
+        "resourceType": "Device",
+        "id": "<client_id>",
+        "client_id": "<client_id>",
+        "client_id_issued_at": 1678886460,
+        "registration_client_uri": "http://localhost:3000/clients/<client_id>",
+        "ext_device_info": {
+          "device_name": "User's iPhone 15 Pro",
+          "os": "iOS",
+          "os_version": "17.1.2"
+        }
+      }
+    }
+  ]
+}
+```
 
 ### 7.2. Step 4: Authenticating and Obtaining Scoped Access Tokens
 
@@ -580,63 +1156,159 @@ Before a client application can perform operations, it must obtain a SMART App L
 
 The client authenticates itself by signing a one-time-use DIDComm message with the private key corresponding to the `client_id` registered in the previous step.
 
+**Standards references (SMART STU 2.2 / asymmetric client auth):**
+- https://build.fhir.org/ig/HL7/smart-app-launch/client-confidential-asymmetric.html
+- https://build.fhir.org/ig/HL7/smart-app-launch/example-app-launch-asymmetric-auth.html
+- https://build.fhir.org/ig/HL7/smart-app-launch/example-backend-services.html
+
+**Implementation note (current gateway):**
+- The gateway exposes a DIDComm-first flow for demo (`/identity/openid/smart/token`). This is not a full SMART
+  App Launch authorize-code + PKCE implementation yet. In demo, the DIDComm payload represents the **authorize
+  request object (JAR)** that would normally be sent to `/authorize`. It includes PKCE fields and the VP.
+- SMART Backend Services (client_credentials + private_key_jwt) are not implemented yet; this is planned for a
+  production-grade integration aligned to the links above.
+
+**ACR binding (OpenID4VP -> SMART):**
+- The SMART token request MUST be bound to a prior OpenID4VP verification event via `acr_values`.
+- Use one of these ACR values depending on the holder type:
+  - `urn:antifraud:acr:openid4vp:employee`
+  - `urn:antifraud:acr:openid4vp:individual`
+- The resulting SMART access token MUST include the matching `acr` value, and SHOULD include `amr` entries such as
+  `openid4vp`, `vc`, and `device_bound`. Optionally include a `vp_hash` claim for audit correlation without
+  disclosing the VP.
+- The token response also includes `ledger_verified` to indicate whether on-chain checks were performed.
+
+**VP requirement (SMART + Gaia-X Clearing House):**
+- The SMART authorization request MUST include a verifiable presentation (VP) in the request object (JAR) or in the
+  DIDComm payload when using the demo flow. This is mandatory to prove non-revocation via the Gaia-X Clearing House
+  before issuing a SMART access token.
+
+**Example workflow for cross-jurisdiction emergency access:**
+
+The Unified Health Identifier (UHI) is represented as a resolvable `did:web` identifier. Resolution of the `did:web`
+identifier provides access to a DID document (`did.json`) that specifies the service endpoints associated with the
+individual’s Unified Health Index (UHIx). This separation between a stable identity anchor and the current service
+location enables continuity of care across organizations and jurisdictions.
+
+1.  A first responder scans a bracelet or device and obtains the individual’s Unified Health Identifier (UHI),
+    expressed as a `did:web` identifier.
+2.  The responder’s client resolves the `did:web` identifier via HTTPS and retrieves the DID document (`did.json`),
+    which specifies the service endpoints of the provider hosting the individual’s Unified Health Index (UHIx), as
+    well as any additional authorized endpoints defined for discovery and access.
+3.  Using the information obtained from the DID document, the responder initiates an OpenID Authorization Request to
+    the UHIx service, following SMART-on-FHIR principles, to obtain a section-scoped access token.
+4.  The responder presents a verifiable credential proving their role and organizational or jurisdictional context,
+    issued by an authorized entity within the shared data space. The authorization request MUST include
+    `acr_values` to request the Authentication Context Class Reference that signals a prior Gaia-X Clearing House VP
+    verification event, such as `urn:antifraud:acr:openid4vp:employee` or `urn:antifraud:acr:openid4vp:individual`.
+5.  The UHIx service evaluates the request against the applicable authorization rules defined by the individual.
+6.  If permitted, the UHIx service issues a scoped access token limited to the authorized IPS sections and actions.
+    The access token includes the matching `acr` (Authentication Context Class Reference) value, linking the SMART
+    authorization decision to the prior VP verification.
+7.  The responder retrieves only the permitted clinical sections from the referenced custodians.
+8.  A hash of the applied policy and discovery artifact can be anchored for integrity and auditability purposes.
+
 #### Secure Envelope: JWE and JWS Headers
 
 For production, the DIDComm message must be a JWE wrapping a JWS. The headers of these envelopes are critical for security and must be constructed as follows:
 
 **JWE Header (Encryption Layer):**
--   `crv` (required): The JWA algorithm for the key agreement protocol (e.g., `ML-KEM-768`).
--   `kid` (required): The identifier of the connector's public key used to encrypt the message.
--   `skid` (required): The identifier of the client's public key.
+-   `alg` (required): The JWA key management algorithm (e.g., `ML-KEM-768`).
+-   `enc` (required): The content encryption algorithm (e.g., `A256GCM`).
+-   `kid` (required): The identifier of the recipient public encryption key (resolved from the target DID Document / JWKS).
+-   `skid` (required): The identifier of the sender public encryption key (so the server can encrypt the async response back).
 -   `typ` (required): Must be `"application/didcomm-encrypted+json"`.
+-   `cty` (required): Must be `"JWS"` to signal the encrypted payload is a compact JWS (nested JOSE).
 
 **JWS Header (Signature Layer):**
 -   `alg` (required): The JWA algorithm used for signing (e.g., `ML-DSA-44`).
 -   `kid` (required): The identifier of the client's private key used to sign the JWT.
--   `typ` (required): Must be `"didcomm-signed+json"`.
+-   `typ` (required): Must be `"application/didcomm-signed+json"`.
+-   `cty` (recommended): `"application/didcomm-plaintext+json"` (the signed payload is a DIDComm plaintext JSON object).
 -   `jku` (optional): The URL pointing to the JWK Set containing the public key. This is not mandatory, as the key can be resolved from the `iss` claim (`did:web`).
 
-#### The Token Request Payload
+**Embedding `jwk` in headers (bootstrap):** In bootstrap flows where the server cannot yet resolve the sender keys from a stored DID/JWKS (e.g., the very first onboarding request), the request may embed a public `jwk` in the header. In that case, keep the embedded `jwk` minimal (thumbprint material only), omitting `kid` and `use`.
 
-The plaintext `body` of the DIDComm message contains the token request.
+#### The Demo Authorization Payload (JAR-equivalent)
+
+The plaintext `body` of the DIDComm message contains the **authorize request object** in demo. This mirrors the
+real SMART `/authorize` request, including PKCE parameters and `vp_token`. The real `/token` exchange (with
+`client_assertion`) is not implemented yet in demo.
 
 **Key Claims:**
--   **`sub` (Subject):** This crucial claim specifies the entity being acted upon. It can be the same as the `iss` (issuer) or a different entity, enabling scenarios like:
-    -   A legal representative (`iss`) acting on behalf of the organization (`sub`).
-    -   An employee (`iss`) acting on behalf of a customer (`sub`).
--   **`scope`:** Defines the permissions requested, following SMART v2.0 syntax (e.g., `organization/PractitionerRole.crus`).
+-   **`client_id`:** The DCR-registered client identifier.
+-   **`redirect_uri`:** The registered redirect URI for the client.
+-   **`code_challenge` / `code_challenge_method`:** PKCE parameters (SMART App Launch).
+-   **`vp_token`:** Verifiable Presentation (JWS or JSON-LD VP) validated by the Gaia-X Clearing House.
+-   **`presentation_submission`:** Presentation Exchange mapping (OpenID4VP), when available.
+-   **`acr_values`:** Requested Authentication Context Class Reference (e.g., `urn:antifraud:acr:openid4vp:employee`).
+-   **`scope`:** Defines the permissions requested, following SMART v2.0 syntax (e.g., `patient/Composition.rs` or `organization/PractitionerRole.crus`).
+    - **Gateway extension (context pinning):** The token context (the target individual) is specified by a mandatory scope item `patient/Composition.<cruds>?subject=<did:web:...:individual:<id>>`.
+      - **Important:** `sub` (JWT/OpenID) and `subject` (FHIR-style context parameter in this gateway extension) are different concepts and must not be confused.
+      - A token MUST be single-patient: all scope items in the request MUST refer to the same `subject`.
 
 The connector is responsible for issuing the access token. Before doing so, it verifies that the requesting entity (`iss`) has the appropriate permissions to perform the operations requested in the `scope` on the subject (`sub`). This verification includes checking against stored consent rules. The resulting signed `access_token` can then be presented to other members of the data space as proof of authorization. For maximum security, the receiving system can further verify the consent rules on the blockchain before granting access.
 
-***Example of a request for a `scoped` SMART token:***
+**On-behalf-of (backend systems):**
+- The SMART Backend Services profile does not define a standard `On-Behalf-Of` header. If a backend system needs to
+  act on behalf of a practitioner, this gateway will treat the practitioner as the `sub` (actor DID) in the token
+  request and the backend system as the client (`iss`/`client_id`). Any custom header like `On-Behalf-Of` should be
+  considered a non-standard extension and must be documented and audited explicitly.
+
+***Example of a demo JAR-equivalent request for a `scoped` SMART token:***
 ```bash
-# This curl example shows the plaintext DIDComm message for requesting a token.
+# This curl example shows the plaintext DIDComm message representing the SMART /authorize request object (JAR).
 # In production, this payload would be signed and encrypted according to the headers above.
-curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/identity/openid/auth/token' \
+curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/identity/openid/smart/token' \
 --header 'Content-Type: application/didcomm-plaintext+json' \
 --data '{
-  "jti": "smart-token-request-id",
-  "thid": "smart-token-thread-id",
-  "iss": "did:web:api.acme.org:employee:admin1@acme.org:device:<uuid>",
+  "jti": "smart-token-request-<test-id>",
+  "thid": "smart-token-thread-<test-id>",
+  "iss": "did:web:api.acme.org:employee:doctor1@acme.org:device:<uuid>",
   "aud": "did:web:api.acme.org",
   "exp": 1678886460,
   "iat": 1678886400,
   "nbf": 1678886400,
   "type": "application/json",
   "body": {
+    "client_id": "did:web:api.acme.org:employee:doctor1@acme.org:device:<uuid>",
+    "redirect_uri": "https://app.acme.org/callback",
+    "code_challenge": "b2MtY2hhbGxlbmdlLWJhc2U2NA",
+    "code_challenge_method": "S256",
+    "acr_values": "urn:antifraud:acr:openid4vp:employee",
+    "vp_token": "<vp-jws-or-jsonld>",
+    "presentation_submission": {
+      "id": "ps-001",
+      "definition_id": "pd-001",
+      "descriptor_map": [
+        {
+          "id": "vp-credential",
+          "format": "jwt_vp",
+          "path": "$.vp_token"
+        }
+      ]
+    },
     "expires_in": 300,
     "token_type": "Bearer",
-    "sub": "did:web:api.acme.org",
-    "scope": "organization/PractitionerRole.crus"
+    "sub": "did:web:api.acme.org:employee:doctor1@acme.org:ISCO-08|2211",
+    "scope": "patient/Composition.rs?subject=did:web:api.acme.org:individual:<unified-health-identifier> patient/Consent.cruds"
   },
   "meta": {
-    "jwe:": {
+    "jwe": {
       "header": {
+        "typ": "application/didcomm-encrypted+json",
+        "cty": "JWS",
+        "enc": "A256GCM",
+        "alg": "ML-KEM-768",
+        "kid": "thumbprint-public-enc-key-recipient",
         "skid": "thumbprint-public-enc-key-device"
       }
     },    
-    "jws:": {
+    "jws": {
       "protected": {
+        "typ": "application/didcomm-signed+json",
+        "cty": "application/didcomm-plaintext+json",
+        "alg": "ML-DSA-44",
         "kid": "thumbprint-public-sig-key-device"
       }
     }
@@ -650,6 +1322,13 @@ After polling for the response, the client will receive a standard OAuth 2.0 tok
 ## 8. End-to-End Business Flows
 
 Now that the organization is registered and the initial administrator has a secure device identity, this section details the complete, end-to-end workflows for common business operations. All actions are performed by obtaining a scoped SMART `access_token` and submitting secure DIDComm messages.
+
+**Conversational AI note:** For the (optional) conversational ingestion + anonymization + observation derivation pipeline, see `docs/04-DEEP-DIVES/04.G-CONVERSATIONAL-AI-ANONYMIZATION-PIPELINE.md`.
+**Data space publication note:** For how the platform publishes data by link (UHIx) vs anchors hashes/tags on blockchain (and how provenance/signatures fit), see `docs/04-DEEP-DIVES/04.H-DATASPACE-PUBLICATION-ATTESTATION.md`.
+
+**Swagger numbering note:** The `/api-docs` Swagger UI presents this journey with its own progressive numbering (`1.x`, `2.x`, `3.x`, ...) to keep the onboarding flow readable in a single flat list. Those numbers map to the order of sections in this guide, but they do not match the guide’s section numbers (`6.x`, `7.x`, `8.x`, `9.x`).
+
+**Individual onboarding model note:** In the current canonical flow, an "individual" is onboarded via a hosted **Family Organization** using the Offer/Order pattern (see Step 6 below). The older direct `Person/_batch` onboarding endpoint is treated as legacy/internal and is not part of the primary journey.
 
 Note that delete operations are generally not permitted for resources like employees to ensure traceability. Instead, objects should be updated to an "inactive" status. For data privacy and "right to be forgotten" requests, specific consent flows must be used to remove an individual's index and personal information.
 
@@ -670,8 +1349,8 @@ curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/entity/org.schema
 --header 'Authorization: Bearer [SMART_TOKEN_FOR_ADMIN]' \
 --header 'Content-Type: application/didcomm-plaintext+json' \
 --data '{
-  "jti": "employeerole-registration-request-id",
-  "thid": "employeerole-registration-thread-id",
+  "jti": "employeerole-registration-request-<test-id>",
+  "thid": "employeerole-registration-thread-<test-id>",
   # The 'iss' is the client_id of the administrator's device.
   "iss": "did:web:api.acme.org:employee:admin1@acme.org:device:<uuid>",
   "aud": "did:web:api.acme.org",
@@ -684,18 +1363,18 @@ curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/entity/org.schema
       "type": "Employee-form-v1.0",
       "meta": { "claims": {
           "org.schema.Person.identifier": "urn:uuid:11b2c3d4-e5f6-7890-1234-567890abcdef",
-          "org.schema.Person.hasOccupation": "ISCO-08:4226",
+          "org.schema.Person.hasOccupation": "ISCO-08|4226",
           "org.schema.Person.email": "receptionist1@acme.org"
       }}
     }]
   },
   "meta": {
-    "jwe:": {
+    "jwe": {
       "header": {
         "skid": "thumbprint-public-enc-key-device-admin"
       }
     },    
-    "jws:": {
+    "jws": {
       "protected": {
         "kid": "thumbprint-public-sig-key-device-admin"
       }
@@ -706,9 +1385,28 @@ curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/entity/org.schema
 
 **Expected Response:** `202 Accepted` with a `Location` header. Polling this location retrieves the final outcome of the job.
 
+**License gating (employee seats):** If the tenant has a finite pool of employee device licenses stored in `device-licenses` and none are `available`, the final polled bundle entry will be an Offer (`Employee-license-offer-v1.0`) containing `org.schema.Offer.*` claims (including `org.schema.Offer.identifier`) instead of creating the employee.
+
 ### 8.2. Step 6: Register a Family Organization
 
 A critical concept is that an individual or a group of related individuals (a family) are managed within their own `Organization` resource. This "Family Organization" is not a top-level tenant but is instead *hosted by* a tenant (e.g., a hospital or insurance provider). This model allows for consistent management of roles, consents, and licenses across all sectors.
+
+#### 8.2.0. Prerequisite: Provider discovery from operator catalog (DSP/DCAT-3)
+
+Before creating a family under a provider, clients should discover available providers from an operator DID:
+
+1. Resolve operator DID Document.
+2. Read `CatalogService.serviceEndpoint`.
+3. Request catalog:
+   - `POST /dcat3/catalog/request`
+4. Optionally fetch dataset detail:
+   - `GET /dcat3/catalog/datasets/{id}`
+
+Hosted tenant form:
+- `POST /{tenantId}/cds-{jurisdiction}/{version}/{sector}/dcat3/catalog/request`
+- `GET /{tenantId}/cds-{jurisdiction}/{version}/{sector}/dcat3/catalog/datasets/{id}`
+
+The response is canonical DSP-style JSON-LD (`dcat:Catalog` with `dcat:dataset`), not an ad-hoc `providers[]` format.
 
 Registration follows the same secure, asynchronous **Offer/Order pattern** as a top-level tenant. There are two primary scenarios for creating a family organization:
 
@@ -732,8 +1430,8 @@ curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/individual/org.sc
 --header 'Authorization: Bearer [OIDC_ID_TOKEN_OF_INDIVIDUAL]' \
 --header 'Content-Type: application/didcomm-plaintext+json' \
 --data '{
-  "jti": "family-registration-request-id",
-  "thid": "family-registration-thread-id",
+  "jti": "family-registration-request-<test-id>",
+  "thid": "family-registration-thread-<test-id>",
   "iss": "adult1@example.com",
   "aud": "did:web:api.acme.org",
   "type": "application/api+json",
@@ -744,6 +1442,10 @@ curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/individual/org.sc
         "claims": {
           "@context": "org.schema",
           "@type": "template",
+          // Claim key normalization:
+          // - When '@context' is 'org.schema', you may send contextualized keys like 'Organization.name' or 'Service.category'.
+          // - The API will normalize them to fully-qualified keys by prepending 'org.schema.' (e.g., 'Service.category' -> 'org.schema.Service.category').
+          // - Claims are stored in a canonical (alphabetical) key order to support future deterministic hashing.
           "Organization.identifier": "urn:uuid:<family-uuid>",
           "Organization.name": "Family of John Doe",
           "Person.alternateName": "Joe",
@@ -759,8 +1461,34 @@ curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/individual/org.sc
     }]
   },
   "meta": {
-    "jwe": { "header": { "jwk": { "...": "..." }}},
-    "jws": { "protected": { "jwk": { "...": "..." }}}
+    "jwe": {
+      "header": {
+        "typ": "application/didcomm-encrypted+json",
+        "cty": "JWS",
+        "enc": "A256GCM",
+        "alg": "ML-KEM-768",
+        "kid": "thumbprint-public-enc-key-recipient",
+        "skid": "thumbprint-public-enc-key-device",
+        "jwk": {
+          "kty": "OKP",
+          "crv": "ML-KEM-768",
+          "x": "base64url-public-enc-key-device"
+        }
+      }
+    },
+    "jws": {
+      "protected": {
+        "typ": "application/didcomm-signed+json",
+        "cty": "application/didcomm-plaintext+json",
+        "alg": "ML-DSA-44",
+        "kid": "thumbprint-public-sig-key-device",
+        "jwk": {
+          "kty": "AKP",
+          "alg": "ML-DSA-44",
+          "pub": "base64url-public-sig-key-device"
+        }
+      }
+    }
   }
 }' -i
 ```
@@ -776,8 +1504,8 @@ curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/individual/org.sc
 --header 'Authorization: Bearer [OIDC_ID_TOKEN_OF_INDIVIDUAL]' \
 --header 'Content-Type: application/didcomm-plaintext+json' \
 --data '{
-  "jti": "family-order-request-id",
-  "thid": "family-order-thread-id",
+  "jti": "family-order-request-<test-id>",
+  "thid": "family-order-thread-<test-id>",
   "iss": "adult1@example.com",
   "aud": "did:web:api.acme.org",
   "type": "application/api+json",
@@ -787,14 +1515,123 @@ curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/individual/org.sc
       "meta": {
         "claims": {
           "@context": "org.schema",
-          "Order.acceptedOffer.identifier": "urn:cds-<jurisdiction>:v1:health-care:product:org.schema:Offer:<family-offer-uuid>"
+          "Order.acceptedOffer.identifier": "urn:cds:ES:v1:health-care:product:org.schema:Offer:7f0b6e9c-2e1d-4d85-94f2-1459f5a57bd7"
         }
       }
     }]
   }
 }' -i
 ```
-After polling, the final response will contain the payment URL to finalize the purchase of the family license(s). Once paid, the Family Organization is active.
+Use the exact Offer identifier returned by the family registration polling response (replace any
+placeholders in examples with the real Offer ID you received).
+After polling, the final response will contain an order response entry with the invoice reference and (when available)
+the payment URL in `Order.paymentUrl`. Once paid, the Family Organization is active.
+
+#### 8.2.2. Step 6b: Register Family Member Relationships (Emergency Contacts)
+
+After the Family Organization exists, the controller can register family members and emergency contacts as `RelatedPerson` relationships under the individual vault. This is the canonical entry point for emergency contacts used by emergency/care-continuity apps.
+
+**Endpoint:** `POST /{tenantId}/cds-{jurisdiction}/v1/{sector}/individual/org.hl7.fhir.api/RelatedPerson/_batch`
+
+**`curl` Example:**
+```bash
+curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/individual/org.hl7.fhir.api/RelatedPerson/_batch' \
+--header 'App-ID: [APP-ID]' \
+--header 'App-Version: [APP-VERSION]' \
+--header 'Authorization: Bearer [SMART_TOKEN_FOR_CONTROLLER]' \
+--header 'Content-Type: application/didcomm-plaintext+json' \
+--data '{
+  "jti": "family-relationship-message-<test-id>",
+  "thid": "thid-family-relationship",
+  "iss": "did:web:api.acme.org:employee:receptionist1@acme.org:device:<uuid>",
+  "aud": "did:web:api.acme.org",
+  "type": "org.hl7.fhir.r4.Bundle",
+  "body": {
+    "resourceType": "Bundle",
+    "type": "batch",
+    "entry": [{
+      "type": "RelatedPerson",
+      "meta": { "claims": {
+        "@context": "org.hl7.fhir.api",
+        "@type": "RelatedPerson:EmergencyContact",
+        "RelatedPerson.patient": "did:web:api.acme.org:individual:<unified-health-identifier>",
+        "RelatedPerson.identifier": "urn:uuid:related-person-uuid",
+        "RelatedPerson.relationship": "http://terminology.hl7.org/CodeSystem/v3-RoleCode|PRN",
+        "RelatedPerson.telecom": "tel:+34600123456",
+        "RelatedPerson.name": "Jane Doe"
+      }},
+      "request": { "method": "POST" }
+    }]
+  }
+}' -i
+```
+
+#### 8.2.3. Step 6c: Collect Personal Observations (Non-Clinical)
+
+After the Family Organization exists (and optionally after registering emergency contacts), the controller or the individual can submit **self-reported** observations for emergencies and care continuity (e.g., functional context, preferences, non-clinical symptoms captured by a conversational assistant).
+
+This endpoint is **not** intended for "official clinical data exchange" (that is done via provider-to-provider links, certified attachments, and indexing flows). These observations are allowed to be more free-form, but should still use standard terminologies when possible.
+
+**Endpoint:** `POST /{tenantId}/cds-{jurisdiction}/v1/{sector}/individual/org.hl7.fhir.api/Observation/_batch`
+
+**FHIR timing guidance (important):**
+
+- `Observation.issued` = when this Observation was created/recorded by the app.
+- `Observation.effective[x]` = when the finding applies (e.g., *NIGHT*, *evenings*, or a specific period).
+  - For recurring time-of-day constraints, use `Observation.date-when` with FHIR `EventTiming` codes: `MORN`, `AFT`, `EVE`, `NIGHT`.
+  - Internally, this can be materialized into canonical FHIR R4/R5 `effectiveTiming.repeat.when` if needed.
+
+**SNOMED code rule (important):** Use **SNOMED concept IDs** as the code (the IPS release file contains both a `descriptionId` and a `conceptId`; the `conceptId` is the code you want in `system|code` tokens).
+
+**`curl` Example (Anxiety at Night):**
+```bash
+curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/individual/org.hl7.fhir.api/Observation/_batch' \
+--header 'App-ID: [APP-ID]' \
+--header 'App-Version: [APP-VERSION]' \
+--header 'Authorization: Bearer [SMART_TOKEN_FOR_CONTROLLER]' \
+--header 'Content-Type: application/didcomm-plaintext+json' \
+--data '{
+  "jti": "personal-observation-message-<test-id>",
+  "thid": "thid-personal-observation",
+  "iss": "did:web:api.acme.org:employee:receptionist1@acme.org:device:<uuid>",
+  "aud": "did:web:api.acme.org",
+  "type": "org.hl7.fhir.r4.Bundle",
+  "body": {
+    "resourceType": "Bundle",
+    "type": "batch",
+    "entry": [{
+      "type": "Observation",
+      "meta": { "claims": {
+        "@context": "org.hl7.fhir.api",
+        "@type": "Observation:SelfReported",
+        "Observation.subject": "did:web:api.acme.org:individual:<unified-health-identifier>",
+        "Observation.category": "http://terminology.hl7.org/CodeSystem/observation-category|social-history",
+        "Observation.code": "SNOMED|48694002",
+        "Observation.code-userselected": true,
+        "Observation.issued": "2025-11-27T10:00:00Z",
+        "Observation.date-when": "NIGHT",
+        "Observation.value-string": "Feels anxious at night.",
+        "Observation.meta-tag": "Anxiety,Night"
+      }},
+      "request": { "method": "POST" }
+    }]
+  }
+}' -i
+```
+
+**LOINC preference items (example):** For many "likes/preferences" (music, reading, etc.), LOINC provides pre-coordinated items (e.g., **MDSv3** questions). These can be represented as simple boolean Observations.
+
+Example items:
+
+- `LOINC|54728-1` = "Resident prefers listening to music"
+- `LOINC|54727-3` = "Resident prefers reading books, newspapers, magazines"
+- `LOINC|54723-2` = "Resident prefers staying up past 8:00 p.m."
+
+**Value encoding note (FHIR Search Parameters):**
+
+- Use `Observation.value-string` for free-text answers.
+- Use `Observation.value-quantity` for numeric quantities using the FHIR `quantity` search syntax (e.g., `5.4|http://unitsofmeasure.org|mg`).
+- Use `Observation.value-concept` for coded answers using `system|code` tokens (e.g., yes/no as `http://terminology.hl7.org/CodeSystem/v2-0136|Y`).
 
 ### 8.3. Step 7: Create a Consent Record
 
@@ -810,8 +1647,8 @@ curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/individual/org.hl
 --header 'Authorization: Bearer [SMART_TOKEN_MANAGE_CONSENT]' \
 --header 'Content-Type: application/didcomm-plaintext+json' \
 --data '{
-  "jti": "consent-fhir-request-id",
-  "thid": "consent-fhir-thread-id",
+  "jti": "consent-fhir-request-<test-id>",
+  "thid": "consent-fhir-thread-<test-id>",
   "iss": "did:web:api.acme.org:employee:receptionist1@acme.org:device:<uuid>",
   "aud": "did:web:api.acme.org",
   "exp": 1678886460,
@@ -825,10 +1662,10 @@ curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/individual/org.hl
       "type": "Consent",
       "meta": {
         "claims": {
-          "@context": "org.hl7.fhir.r4",
+          "@context": "org.hl7.fhir.api",
           "Consent.action": "LOINC|48765-2",
           "Consent.actor-reference": "did:web:hospital.example.com",
-          "Consent.actor-role": "ISCO-08|2221",
+          "Consent.actor-role": "ISCO-08|2211",
           "Consent.attachment-contentType": "application/odrl+json",
           "Consent.attachment-data": "eyAiQGNvbnRleHQiOiAiaHR0cDovL3d3dy53My5vcmcvbnMvb2RybC5qc29ubGQiLCAiQHR5cGUiOiAiQWdyZWVtZW50Ii...sgIlRSRUFUIiB9XSB9XSB9",
           "Consent.date": "2025-11-25",
@@ -872,11 +1709,419 @@ curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/individual/org.hl
 ```
 **Expected Response:** `202 Accepted` with a `Location` header. Polling retrieves the outcome of the consent creation job.
 
+**Rule identity (idempotency):** Each `entry` in the consent bundle is treated as **one atomic consent rule**. The rule document stored in the individual's vault uses a deterministic `id` computed as `sha3-384("<subject>|<sector>|<target>|<permit|deny>|<purpose>")`, where `<target>` is `Consent.actor-identifier` (some payloads use the alias `Consent.actor-reference`) and may be a `did:web`, a country code, or an email.
+
+**Claims canonicalization:** Claims should use `@context: "org.hl7.fhir.api"` to avoid inconsistencies between FHIR versions and keep the consent vocabulary stable across sectors. Clients may submit contextualized keys without the `@context` prefix (e.g., `Consent.purpose`); the gateway normalizes them before hashing and storage by prefixing missing keys with `${@context}.` and sorting keys alphabetically.
+
 ### 8.4. Step 8: Send a Secure Communication
 
 Based on a prior `Consent`, an authorized employee or data provider can send a secure communication (e.g., an appointment reminder) to a patient and any related persons defined in the consent rules.
 
 **Endpoint:** `POST /{tenantId}/cds-{jurisdiction}/v1/{sector}/individual/org.hl7.fhir.r4/Communication/_batch`
+
+**Note:** The gateway also exposes a simplified/demo endpoint `POST /v1/{sector}/individual/org.hl7.fhir.r4/Communication` that accepts a raw FHIR `Communication` resource (no DIDComm, no `_batch`). The canonical integration flow described here uses the async DIDComm `_batch` endpoint.
+
+### Canonical ingestion contract (Frontend/SDK)
+
+To avoid ambiguity across use cases (single communication, multiple communications, IPS imports), the canonical contract is:
+
+- `body.resourceType = "Bundle"`
+- `body.type = "batch"`
+- payload entries in `body.entry[]`
+
+Backward compatibility:
+- The backend also accepts `body.data[]` (JSON:API-like envelope) for current clients/SDKs.
+- Frontend `CommMsgExtended` payloads should be mapped by the SDK into this canonical bundle model.
+
+Recommended mapping for frontend assistant flows:
+
+1. Assistant produces one or more communication intents (including optional `contentReference` URLs and `contentAttachment` binary payloads).
+2. Client SDK wraps them into a single `Bundle` (`type="batch"`, `entry[]`).
+3. Backend processes each entry independently and returns a `batch-response`.
+
+Practical guidance:
+- Use `Communication` entries for conversational/user-provided intake events.
+- Use explicit FHIR `Bundle` ingestion for IPS and other structured document payloads.
+- Keep transport envelope stable; let backend route/store by resource type and policy.
+
+### DocumentReference-first ingestion (FHIR-based, version-agnostic)
+
+For document ingestion with URL and/or file attachment, use `DocumentReference` as the primary registration/indexing resource (not `Communication` and not `Bundle document` as first step).
+
+The contract is **FHIR-based** (not schema.org) and **version-agnostic** at integration level:
+- clients exchange stable `DocumentReference.*` keys (search-parameter style),
+- backend/storage can materialize to profile-specific structures (R4/R4B/R5/R6) as needed.
+
+- Endpoint: `POST /{tenantId}/cds-{jurisdiction}/v1/{sector}/individual/org.hl7.fhir.r4/DocumentReference/_batch`
+- Envelope: DIDComm payload with `body.resourceType="Bundle"`, `body.type="batch"`, `body.entry[]`
+- Claims namespace: `DocumentReference.*` only (FHIR-aligned, search-parameter style)
+
+Two-phase UI/backend flow (recommended):
+1. **Phase 1 (always):** Create `DocumentReference` with confidential and non-confidential metadata.
+2. **Phase 2 (optional actions):**
+   - Register evidence anchoring (if creator is competent and policy allows).
+   - Send communication to recipients.
+   - Finalize/close screen without communication.
+
+This keeps "document indexing" and "message exchange" as separate concerns.
+
+Buttons mapping (frontend intent):
+- `Finalize`: return/close after Phase 1.
+- `Register evidence`: perform evidence anchoring/statistical publication policy path.
+- `Send communication`: create `Communication` using recipients + optional document attachment/reference.
+
+Recipient sources:
+- Subject DID can be prefilled.
+- Controllers/guardians and other recipients should come from cached index data when available.
+- If frontend cache is stale/missing, backend recipient discovery endpoint is required (target capability; not fully standardized in this guide yet).
+
+#### DocumentReference field contract used by the component
+
+Fields captured by the form (normalized names):
+- `DocumentReference.attester` (did:web)
+- `DocumentReference.attester` (`personal | professional | legal | official`)
+- `DocumentReference.author` (did:web)
+- `DocumentReference.basedOn` (URL of source FHIR resource)
+- `DocumentReference.category` (document group / higher-level classification)
+- `DocumentReference.contentdata` (base64)
+- `DocumentReference.contenttype` (e.g., `application/pdf`)
+- `DocumentReference.context` (`Appointment | Encounter | EpisodeOfCare`)
+- `DocumentReference.creation` (source info creation time)
+- `DocumentReference.date` (attester registration time)
+- `DocumentReference.description`
+- `DocumentReference.event-code` (main code)
+- `DocumentReference.event-reference` (source FHIR URL)
+- `DocumentReference.format-uri` (e.g., `urn:ihe:dent:PDF`)
+- `DocumentReference.identifier`
+- `DocumentReference.language`
+- `DocumentReference.location` (e.g., PDF URL from source FHIR resource)
+- `DocumentReference.modality` (DICOM modality/equipment function)
+- `DocumentReference.relatesto`
+- `DocumentReference.relation` (e.g., `appends`)
+- `DocumentReference.subject` (URN for index section)
+- `DocumentReference.type` (sector-specific lower-level type)
+
+##### Claim-by-claim meaning and example
+
+| Claim / Form Field | Meaning | Example |
+|---|---|---|
+| `DocumentReference.attester` | DID of the party attesting registration. | `did:web:hospital.example.com:employee:adm-332` |
+| `DocumentReference.attester` | Attester role (`personal | professional | legal | official`). | `professional` |
+| `DocumentReference.author` | DID of the source author. | `did:web:lab.example.com:system:lisin` |
+| `DocumentReference.basedOn` | URL of the source FHIR resource. | `https://ehr.example.com/fhir/ServiceRequest/sr-991` |
+| `DocumentReference.category` | Group of documents (higher-level). | `http://hl7.org/fhir/ValueSet/document-classcodes|LP173418-7` |
+| `DocumentReference.contentdata` | Base64 document data. | `JVBERi0xLjc...` |
+| `DocumentReference.contenttype` | Content MIME type. | `application/pdf` |
+| `DocumentReference.context` | Context (`Appointment | Encounter | EpisodeOfCare`). | `Encounter/enc-123` |
+| `DocumentReference.creation` | When source information was created. | `2026-02-10T08:20:00Z` |
+| `DocumentReference.date` | When attester registers the information. | `2026-02-10T10:05:33Z` |
+| `DocumentReference.description` | Human-readable description. | `Vital signs report from home device` |
+| `DocumentReference.event-code` | Main code for source FHIR resource. | `http://loinc.org|85354-9` |
+| `DocumentReference.event-reference` | URL of source FHIR resource. | `https://ehr.example.com/fhir/Observation/obs-778` |
+| `DocumentReference.format-uri` | Format URI. | `urn:ihe:dent:PDF` |
+| `DocumentReference.identifier` | Business identifier. | `docref-2026-00042` |
+| `DocumentReference.language` | Document language. | `en` |
+| `DocumentReference.location` | URL for the source PDF/file. | `https://ehr.example.com/fhir/Binary/bin-123` |
+| `DocumentReference.modality` | DICOM modality / acquisition technique. | `http://dicom.nema.org/resources/ontology/DCM|CT` |
+| `DocumentReference.relatesto` | Previous/related document reference. | `DocumentReference/docref-00041` |
+| `DocumentReference.relation` | Relationship with related document. | `append` |
+| `DocumentReference.subject` | URN for index section in individual index. | `urn:uhix:section:vitals` |
+| `DocumentReference.type` | Sector-specific lower-level type. | `http://hl7.org/fhir/ValueSet/c80-doc-typecodes|34133-9` |
+
+Implementation note:
+- Some fields above are profile-dependent in R4/R5 and may map to extensions or constrained elements.
+- Keep semantic compatibility with the selected profile/version when materializing resources.
+
+Note:
+- Do not mix schema.org onboarding claims into this flow.
+- Claims-first payloads go in `body.data[].meta.claims` (`@context: org.hl7.fhir.api` + `DocumentReference.*` keys).
+- Profile-specific FHIR resources, when needed, go in `body.entry[].resource`.
+
+R4/R5 terminology references for type/category:
+- R4 `DocumentReference.type`: `http://hl7.org/fhir/ValueSet/c80-doc-typecodes`
+- R5 `DocumentReference.type`: `http://hl7.org/fhir/ValueSet/doc-typecodes`
+- R4 `DocumentReference.category`: `http://hl7.org/fhir/ValueSet/document-classcodes`
+- R5 category-style reference set: `https://hl7.org/fhir/R5/valueset-referenced-item-category.html`
+
+#### Invoice example (non-clinical domain)
+
+`DocumentReference` can also represent invoices and other sector documents.
+Example pattern:
+- `basedOn`: URL of the source FHIR `Invoice` resource.
+- `content.attachment.url`: URL of PDF invoice (or `content.data` with base64 if embedded).
+- `type/category`: billing domain classifications.
+
+```json
+{
+  "resourceType": "Bundle",
+  "type": "batch",
+  "entry": [{
+    "request": { "method": "POST", "url": "individual/org.hl7.fhir.r4/DocumentReference" },
+    "resource": {
+      "resourceType": "DocumentReference",
+      "status": "current",
+      "subject": { "reference": "did:web:api.acme.org:individual:abc" },
+      "date": "2026-02-10T10:00:00Z",
+      "author": [{ "reference": "did:web:hospital.example.com" }],
+      "type": { "coding": [{ "system": "http://terminology.hl7.org/CodeSystem/v2-0270", "code": "INV" }] },
+      "category": [{ "coding": [{ "system": "http://terminology.hl7.org/CodeSystem/document-classcodes", "code": "BILL" }] }],
+      "description": "Invoice for outpatient episode",
+      "context": { "encounter": [{ "reference": "Encounter/enc-123" }] },
+      "content": [{
+        "attachment": {
+          "contentType": "application/pdf",
+          "url": "https://ehr.example.com/fhir/Invoice/inv-123/$pdf",
+          "title": "invoice-inv-123.pdf"
+        }
+      }],
+      "basedOn": [{ "reference": "https://ehr.example.com/fhir/Invoice/inv-123" }]
+    }
+  }]
+}
+```
+
+### Communication carrying a Bundle document
+
+Frontend/SDK may also send a `Bundle` `type="document"` inside a `Communication` payload:
+- as inline attachment (`payload[].contentAttachment.data`, base64-encoded JSON/PDF), or
+- as reference (`payload[].contentReference.reference`) when the document is stored externally.
+
+This allows one request to both notify recipients and deliver the document artifact.
+
+**Endpoint/format choice:**
+- Use `individual/org.hl7.fhir.r4/Communication/_batch` when the attached payload is a versioned FHIR document (for example a R4 `Bundle` `type="document"` with `Composition`).
+- Use `individual/org.hl7.fhir.api/Communication/_batch` when you intentionally exchange version-agnostic interoperable claims (not tied to a specific FHIR release, e.g., onboarding-style data modeled as generic claims).
+
+In both cases, the transport contract remains the same (`body.resourceType="Bundle"`, `body.type="batch"`, `body.entry[]`).
+
+### Concrete frontend examples
+
+**A) Conversational chat (raw, not yet structured)**
+- User writes free text in chat.
+- Frontend sends one `Communication` entry.
+- This is useful for anonymization/context pipelines even when no clinical resource is extracted yet.
+
+```json
+{
+  "resourceType": "Bundle",
+  "type": "batch",
+  "entry": [{
+    "request": { "method": "POST", "url": "individual/org.hl7.fhir.r4/Communication" },
+    "resource": {
+      "resourceType": "Communication",
+      "status": "completed",
+      "category": [{ "coding": [{ "system": "http://terminology.hl7.org/CodeSystem/communication-category", "code": "notification" }] }],
+      "subject": { "reference": "did:web:...:individual:abc" },
+      "note": [{ "text": "Since yesterday I have had dizziness and headache after running." }]
+    }
+  }]
+}
+```
+
+**B) Screen with `text description` + `analyze` (line-by-line extraction)**
+- UI hint: "Use one line per finding".
+- Analyzer treats each line as a candidate clinical resource.
+- If user confirms extraction, build a `Bundle` `type="document"` with `Composition.section` set to the target history section (for example `LOINC|8716-3` for Vital signs in healthcare).
+- Do not use a generic `alert` category for this indexing use case; prefer the explicit section code in `Composition.section`.
+
+**C) Communication carrying a document (IPS/vital signs)**
+- Conversation can include attachments.
+- A `Communication` may carry the document generated in B as:
+  - `payload[].contentAttachment` (inline), or
+  - `payload[].contentReference` (URL to stored document).
+
+```json
+{
+  "resourceType": "Communication",
+  "status": "completed",
+  "subject": { "reference": "did:web:...:individual:abc" },
+  "payload": [{
+    "contentAttachment": {
+      "contentType": "application/fhir+json",
+      "title": "vital-signs-document.json",
+      "data": "<base64 of Bundle type=document>"
+    }
+  }]
+}
+```
+
+### PersonalEvidenceComposer backend example (reference contract)
+
+For the `PersonalEvidenceComposer` UI flow:
+- Always create a document submission (`Bundle/_batch`, where document payload is `Bundle type=document`).
+- Optionally create a communication submission (`Communication/_batch`) that references or embeds that document.
+
+Policy constraints:
+- `qualifiedCreator` is an internal security flag (derived from trusted identity/authorization policy, not user input).
+- `registerResearchMetadata` is computed by policy and should only be true when:
+  1. creator is qualified,
+  2. an attachment exists,
+  3. a code is selected,
+  4. review attestation is present.
+- Statistical metadata is anonymous and append-only; avoid user-editable toggles that could publish accidental wrong data.
+
+Minimal document submission shape:
+```json
+{
+  "resourceType": "Bundle",
+  "type": "batch",
+  "entry": [{
+    "request": { "method": "POST", "url": "individual/org.hl7.fhir.r4/Bundle" },
+    "resource": {
+      "resourceType": "Bundle",
+      "type": "document",
+      "entry": [{
+        "resource": {
+          "resourceType": "Composition",
+          "status": "final",
+          "subject": { "reference": "did:web:...:individual:abc" },
+          "section": [{
+            "code": { "coding": [{ "system": "http://loinc.org", "code": "8716-3" }] }
+          }]
+        }
+      }]
+    }
+  }]
+}
+```
+
+Minimal communication submission shape (document attached):
+```json
+{
+  "resourceType": "Bundle",
+  "type": "batch",
+  "entry": [{
+    "request": { "method": "POST", "url": "individual/org.hl7.fhir.r4/Communication" },
+    "resource": {
+      "resourceType": "Communication",
+      "status": "completed",
+      "subject": { "reference": "did:web:...:individual:abc" },
+      "payload": [{
+        "contentAttachment": {
+          "contentType": "application/fhir+json",
+          "title": "personal-evidence-document.json",
+          "data": "<base64 document bundle>"
+        }
+      }]
+    }
+  }]
+}
+```
+
+### Messaging (DIDComm v2, non‑FHIR)
+Some applications cannot run the SDK locally. For these, the gateway exposes DIDComm messaging endpoints
+as a **fallback**. SDK-based local crypto is still the recommended approach.
+
+**Base Path:**
+`/{tenantId}/cds-{jurisdiction}/v1/{sector}/messaging/{format}/{resourceType}/{action}`
+
+**Format:** `legacy-crypto` | `post-quantum`  
+**ResourceType:** `didcomm-plaintext` | `didcomm-signed` | `didcomm-encrypted`  
+**Actions:** `_send` | `_receive` | `_messages` | `_get` | `_delete`
+
+**Example (send encrypted DIDComm):**
+`POST /acme/cds-es/v1/health-care/messaging/post-quantum/didcomm-encrypted/_send`
+
+**ICA status notifications**
+Once the ICA completes verification, the legal representative receives a **message**.  
+Use `_messages` to list and `_get` to fetch the content.
+
+**Delivery model (host proxy -> tenant controllers)**
+- The host acts as a proxy/orchestrator and delivers the ICA result into the **tenant** messaging domain.
+- Controllers (including the legal representative) retrieve messages from their tenant route:
+  `/{tenantId}/cds-{jurisdiction}/v1/{tenantSector}/messaging/...`
+- `system` is reserved for host/system operations, not tenant user inboxes.
+
+**Cryptographic model (required for private user messaging)**
+- Private user messages must be encrypted for **user-owned key(s)** (wallet and/or registered device keys), not only with a tenant-at-rest key.
+- Recommended container: DIDComm/JWE JSON General Serialization with one CEK and multiple recipients (`recipients[]`).
+- Tenant-level keying may still protect metadata/indexes, but not as the only protection layer for user-private content.
+
+**Response mode semantics**
+- `didcomm-encrypted`: return JWE as-is; backend does not decrypt payload.
+- `didcomm-signed`: backend may decrypt/transform and returns signed envelope.
+- `didcomm-plaintext`: backend may decrypt/transform and returns plaintext JSON.
+
+**Proxy re-encryption policy**
+- Re-encryption (CEK rewrap for another user key/device key) is allowed when needed for delivery compatibility.
+- If strict E2E is required, disable server-side decrypt/transform and allow only `didcomm-encrypted` retrieval.
+
+**Example payload (stored message, JSON:API)**
+```json
+{
+  "data": [{
+    "type": "IcaEnrollResponse-v1.0",
+    "id": "urn:uuid:2d8e5f4a-7c6a-4e18-9a61-0c2fd2a4b2e2",
+    "resource": {
+      "resourceType": "IcaEnrollmentResult",
+      "status": "approved",
+      "certificate": "-----BEGIN CERTIFICATE-----...",
+      "chain": ["-----BEGIN CERTIFICATE-----..."],
+      "caName": "ica"
+    }
+  }]
+}
+```
+
+**Example request**
+```bash
+curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/messaging/post-quantum/didcomm-plaintext/_send' \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer demo' \
+  --data '{"data":[{"type":"IcaEnrollResponse-v1.0","id":"urn:uuid:2d8e5f4a-7c6a-4e18-9a61-0c2fd2a4b2e2","resource":{"resourceType":"IcaEnrollmentResult","status":"approved","certificate":"-----BEGIN CERTIFICATE-----...","chain":["-----BEGIN CERTIFICATE-----..."],"caName":"ica"}}]}' 
+```
+
+**List messages**
+```bash
+curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/messaging/post-quantum/didcomm-plaintext/_messages' \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer demo' \
+  --data '{"thid":"thid-messages"}'
+```
+
+**Get a message**
+```bash
+curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/messaging/post-quantum/didcomm-plaintext/_get' \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer demo' \
+  --data '{"id":"urn:uuid:2d8e5f4a-7c6a-4e18-9a61-0c2fd2a4b2e2"}'
+```
+
+### Observability/Audit Logging and User Visibility
+For data-space compliance, all sensitive messaging operations should be auditable through a dedicated
+**Observability service**.
+
+**Responsibility boundary:**
+- **Clearing House**: VP/VC compliance verification and credential/status checks (including revocation status where applicable).
+- **Observability**: operational/security audit logs (message delivery mode, decrypt/reencrypt events, actor traceability).
+
+The user (or tenant controller) must be able to query logs for their own messages:
+- `message.stored`
+- `message.delivered_encrypted`
+- `message.decrypted_server_side`
+- `message.reencrypted`
+- `message.deleted`
+
+Recommended minimum audit fields:
+- `eventId`, `timestamp`, `tenantId`, `subject` (user DID/URN), `messageId`, `thid`
+- `operation`, `formatRequested`, `actor` (user/app/service), `policyId`, `result`
+- `recipientKids[]` (key identifiers only), optional `ledgerAnchor` (`txId`, `txTime`)
+
+Routing convention:
+- `/{tenantId}/cds-{jurisdiction}/v1/{sector}/{section}/{format}/{resourceType}/{action}`
+- For observability: `section=audit`
+
+Recommended endpoint family (target architecture):
+- DIDComm message audit:
+  - `POST /{tenantId}/cds-{jurisdiction}/v1/{sector}/audit/didcomm/message/_search`
+  - `POST /{tenantId}/cds-{jurisdiction}/v1/{sector}/audit/didcomm/message/_get`
+  - `POST /{tenantId}/cds-{jurisdiction}/v1/{sector}/audit/didcomm/message/_export`
+- FHIR communication audit (same pattern, different format/resourceType):
+  - `POST /{tenantId}/cds-{jurisdiction}/v1/{sector}/audit/fhir/communication/_search`
+
+Current implementation note:
+- This repository already contains a `ClearingHouseService` for VP/compliance verification.
+- Full standardized audit API exposure for messaging is a target capability and should be wired as a dedicated manager/router.
 
 **`curl` Example:**
 ```bash
@@ -886,8 +2131,8 @@ curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/individual/org.hl
 --header 'Authorization: Bearer [SMART_TOKEN_SEND_COMMUNICATION]' \
 --header 'Content-Type: application/didcomm-plaintext+json' \
 --data '{
-  "jti": "communication-fhir-request-id",
-  "thid": "communication-fhir-thread-id",
+  "jti": "communication-fhir-request-<test-id>",
+  "thid": "communication-fhir-thread-<test-id>",
   "iss": "did:web:hospital.example.com",
   "aud": "did:web:api.acme.org",
   "exp": 1678886460,
@@ -895,9 +2140,11 @@ curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/individual/org.hl
   "nbf": 1678886400,   
   "type": "org.hl7.fhir.r4.Bundle",
   "body": {
+    "resourceType": "Bundle",
+    "type": "batch",
     "entry": [{
-      meta: {
-        claims: {
+      "meta": {
+        "claims": {
           "@context": "org.hl7.fhir.api",
           "@type": "Communication:Appointment",
           "Communication.category": "http://terminology.hl7.org/CodeSystem/communication-category|appointment-reminder",
@@ -906,10 +2153,10 @@ curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/individual/org.hl
           "Communication.content-attachment-type": "text/calendar",
           "Communication.content-reference": "https://url-to-appointment-source.com/some-uuid",
           "Communication.partOf": "urn:uuid:communication-channel-id",
-          "Communciation.recipient": "did:web:api.acme.org:individual:<unified-health-identifier>",
+          "Communication.recipient": "did:web:api.acme.org:individual:<unified-health-identifier>",
           "Communication.sender": { "reference": "did:web:hospital.example.com" },
           "Communication.sent": "2025-10-15T14:30:00Z",        
-          "Communciation.subject": "did:web:api.acme.org:individual:<unified-health-identifier>",
+          "Communication.subject": "did:web:api.acme.org:individual:<unified-health-identifier>",
           "Communication.text": "<br>This is your new appointment. Best regards.</br>"
         }
       },    
@@ -946,10 +2193,8 @@ curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/individual/org.hl
         "sent": "2025-10-15T14:30:00Z",
         "status": "completed"
       }
-    },
-    "resourceType": "Bundle",
-    "type": "batch"
-  }]
+    }]
+  }
 }' -i
 ```
 
@@ -968,12 +2213,12 @@ In this example, a practitioner from `hospital.example.com`, having been granted
 curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/individual/org.hl7.fhir.r4/Composition/_batch' \
 --header 'App-ID: [APP-ID]' \
 --header 'App-Version: [APP-VERSION]' \
-# Token obtained by the external practitioner with scope 'user/Composition.write'
+# Token obtained by the external practitioner with scope 'patient/Composition.u?subject=<unified-health-identifier>'
 --header 'Authorization: Bearer [SMART_TOKEN_FOR_COMPOSITION]' \
 --header 'Content-Type: application/didcomm-plaintext+json' \
 --data '{
-  "jti": "composition-update-request-id",
-  "thid": "composition-update-thread-id",
+  "jti": "composition-update-request-<test-id>",
+  "thid": "composition-update-thread-<test-id>",
   "iss": "did:web:hospital.example.com",
   "aud": "did:web:api.acme.org",
   "exp": 1678886460,
@@ -1042,347 +2287,87 @@ A core feature of the Unified Health Index is to ensure that a consolidated vers
 
 2.  **Consolidation and Secure Sharing:** The user's application can then generate a new, consolidated FHIR Bundle document that represents the complete, up-to-date Unified Health Index. This unified clinical history can then be securely shared with a new provider or family member via a `Communication` request, as detailed in **Section 8.4**.
 
-The endpoint below is the mechanism for uploading **any** FHIR Bundle document—whether a source document or a consolidated history—into the user's secure data store.
+#### 10.A FHIR Bundle `document` (Composition index)
 
-**Endpoint:** `POST /{tenantId}/cds-{jurisdiction}/v1/{sector}/individual/org.hl7.fhir.r4/Bundle/_document`
+Use a FHIR Bundle with `type="document"` when you are submitting a *document payload* intended to be indexed (typically a Bundle whose first entry is a `Composition` that references the included resources). In this guide, health/IPS examples are used, but the same document pattern is reusable in other domains.
+
+**Important distinction (two Bundle layers):**
+- **Operational Bundle** (`type="batch"`): transport envelope used by the gateway action (`/_batch`).
+- **Bundle document** (`type="document"`): the actual document payload, including `Composition`.
+- A single `/_batch` request may carry one or multiple `Bundle` documents in `body.entry[].resource`.
+
+The endpoint below is the mechanism for uploading **any** FHIR Bundle document—whether a source document or a consolidated history—into the user's secure data store, wrapped in an operational batch envelope.
+
+**Endpoint:** `POST /{tenantId}/cds-{jurisdiction}/v1/{sector}/individual/org.hl7.fhir.r4/Bundle/_batch`
 
 **`curl` Example:**
 ```bash
-curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/individual/org.hl7.fhir.r4/Bundle/_document_' \
+curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/individual/org.hl7.fhir.r4/Bundle/_batch' \
 --header 'App-ID: [APP-ID]' \
 --header 'App-Version: [APP-VERSION]' \
-# Token obtained by the external practitioner with scope 'user/Composition.write'
+# Token obtained by the external practitioner with scope 'patient/Bundle.c?subject=<unified-health-identifier>'
 --header 'Authorization: Bearer [SMART_TOKEN_FOR_BUNDLE_DOC]' \
 --header 'Content-Type: application/didcomm-plaintext+json' \
 --data '{
-  "jti": "document-update-request-id",
-  "thid": "document-update-thread-id",
-  "iss": "did:web:api.acme.org:individual:<unified-health-id>:device:<id>
+  "jti": "document-update-request-<test-id>",
+  "thid": "document-update-thread-<test-id>",
+  "iss": "did:web:api.acme.org:individual:<unified-health-id>:device:<id>",
   "aud": "did:web:api.acme.org",
   "exp": 1678886460,
   "iat": 1678886400,
-  "nbf": 1678886400,   
+  "nbf": 1678886400,
   "type": "org.hl7.fhir.r4.Bundle",
   "body": {
-    "identifier": {
-      "system": "http://hl7.eu/fhir/sid/uvci",
-      "value": "V1IT454557891308174803488707671418",
-      "period": {
-        "start": "2025-02-10"
-      }
-    },
     "resourceType": "Bundle",
-    "timestamp": "2025-02-10T14:30:00+01:00",
-    "type": "document",
+    "type": "batch",
     "entry": [
       {
-        "fullUrl": "urn:uuid:30551ce1-5a28-4356-b684-1e639094ad4d",
+        "request": { "method": "POST", "url": "individual/org.hl7.fhir.r4/Bundle" },
         "resource": {
-          "resourceType": "Composition",
-          "id": "30551ce1-5a28-4356-b684-1e639094ad4d",
-          "text": {
-            "status": "generated",
-            "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><p><b>Generated Narrative</b></p><p><b>identifier</b>: id: 3f69e0a5-2177-4540-baab-7a5d0877428f</p><p><b>status</b>: final</p><p><b>type</b>: <span title=\"Codes: {http://loinc.org 82593-5}\">Immunization summary report</span></p><p><b>date</b>: Feb 10, 2021, 1:30:00 PM</p><p><b>author</b>: <a href=\"#Practitioner_d7a490a1-d267-4785-ac98-db56748827fb\">See above (Practitioner/d7a490a1-d267-4785-ac98-db56748827fb)</a></p><p><b>title</b>: Vaccine Certificate Covid-19</p><h3>Attesters</h3><table class=\"grid\"><tr><td>-</td><td><b>Mode</b></td><td><b>Time</b></td><td><b>Party</b></td></tr><tr><td>*</td><td>legal</td><td>Dec 27, 2020, 1:30:00 PM</td><td><a href=\"#Organization_45a5c5b1-4ec1-4d60-b4b2-ff5a84a41fd7\">See above (Organization/45a5c5b1-4ec1-4d60-b4b2-ff5a84a41fd7)</a></td></tr></table><p><b>custodian</b>: <a href=\"#Organization_b66c1b23-21e9-4bd0-9cd7-edd806c126de\">See above (Organization/b66c1b23-21e9-4bd0-9cd7-edd806c126de)</a></p></div>"
-          },
-          "identifier": {
-            "system": "urn:oid:2.16.724.4.8.10.200.10",
-            "value": "3f69e0a5-2177-4540-baab-7a5d0877428f"
-          },
-          "status": "final",
-          "type": {
-            "coding": [
-              {
-                "system": "http://loinc.org",
-                "code": "82593-5",
-                "display": "Immunization summary report"
-              }
-            ]
-          },
-          "subject": {
-            "reference": "urn:uuid:2b90dd2b-2dab-4c75-9bb9-a355e07401e8"
-          },
-          "date": "2025-02-10T14:30:00+01:00",
-          "author": [
+          "resourceType": "Bundle",
+          "id": "uhi-doc-2026-01-15",
+          "timestamp": "2026-01-15T10:30:00Z",
+          "type": "document",
+          "entry": [
             {
-              "reference": "urn:uuid:d7a490a1-d267-4785-ac98-db56748827fb"
-            }
-          ],
-          "title": "Vaccine Certificate Covid-19",
-          "attester": [
-            {
-              "mode": "legal",
-              "time": "2020-12-27T14:30:00+01:00",
-              "party": {
-                "reference": "urn:uuid:45a5c5b1-4ec1-4d60-b4b2-ff5a84a41fd7"
-              }
-            }
-          ],
-          "custodian": {
-            "reference": "urn:uuid:b66c1b23-21e9-4bd0-9cd7-edd806c126de"
-          },
-          "section": [
-            {
-              "title": "Vaccinations",
-              "code": {
-                "coding": [
+              "fullUrl": "urn:uuid:composition-1",
+              "resource": {
+                "resourceType": "Composition",
+                "id": "composition-1",
+                "status": "final",
+                "type": { "coding": [{ "system": "http://loinc.org", "code": "60591-5" }] },
+                "subject": { "reference": "urn:uuid:patient-1" },
+                "date": "2026-01-15T10:30:00Z",
+                "title": "Clinical document example",
+                "section": [
                   {
-                    "system": "http://loinc.org",
-                    "code": "11369-6",
-                    "display": "Hx of Immunization"
+                    "code": { "coding": [{ "system": "http://loinc.org", "code": "48765-2" }] },
+                    "entry": [{ "reference": "urn:uuid:vitalsign-1" }]
                   }
                 ]
-              },
-              "text": {
-                "status": "generated",
-                "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><p><strong>Maria Rossi (RSSMRA97L67Z602C)</strong></p><p><span>COVID-19 mRNA Vaccine&nbsp;</span></p><p>Last Update: 2025-02-05</p><ol><li>Dose 1/2<ol><li>Date and time of vaccination: 2025-01-10</li><li><span>AIC#049283: COVID-19 Vaccine Moderna (MODERNA BIOTECH SPAIN, S.L.) - Lot#B1235742&nbsp;</span></li><li>Ospedale Careggi - Firenze</li></ol></li><li>Dose 2/2<ol><li>Date vaccine due: 2025-02-07</li><li>Status: contraindicated (Medical Precaution)</li></ol></li></ol></div>"
-              },
-              "entry": [
-                {
-                  "reference": "urn:uuid:42befbaf-eba8-44ec-b7d6-0e4a996e0760"
-                },
-                {
-                  "reference": "urn:uuid:c220e36c-eb67-4fc4-9ba1-2fabc52acec6"
-                }                
-              ]
-            }
-          ]
-        }
-      },
-      {
-        "fullUrl": "urn:uuid:2b90dd2b-2dab-4c75-9bb9-a355e07401e8",
-        "resource": {
-          "resourceType": "Patient",
-          "id": "2b90dd2b-2dab-4c75-9bb9-a355e07401e8",
-          "text": {
-            "status": "generated",
-            "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><p><b>Generated Narrative</b></p><p><b>identifier</b>: id: RSSMRA97L67Z602C</p><p><b>name</b>: Maria Rossi </p><p><b>gender</b>: female</p><p><b>birthDate</b>: 1997-07-28</p></div>"
-          },
-          "identifier": [
-            {
-              "system": "http://hl7.it/sid/codiceFiscale",
-              "value": "RSSMRA97L67Z602C"
-            }
-          ],
-          "name": [
-            {
-              "family": "Rossi",
-              "given": [
-                "Maria"
-              ]
-            }
-          ],
-          "gender": "female",
-          "birthDate": "1990-07-28",
-          "address": {
-            "country": "CA"
-          }          
-        }
-      },
-      {
-        "fullUrl": "urn:uuid:c220e36c-eb67-4fc4-9ba1-2fabc52acec6",
-        "resource": {
-          "resourceType": "ImmunizationRecommendation",
-          "id": "c220e36c-eb67-4fc4-9ba1-2fabc52acec6",
-          "text": {
-            "status": "generated",
-            "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><p><b>Generated Narrative</b></p><p><b>patient</b>: <a href=\"#Patient_2b90dd2b-2dab-4c75-9bb9-a355e07401e8\">See above (Patient/2b90dd2b-2dab-4c75-9bb9-a355e07401e8)</a></p><p><b>date</b>: 2025-02-05</p><blockquote><p><b>recommendation</b></p><p><b>vaccineCode</b>: <span title=\"Codes: {http://snomed.info/sct 1119349007}\">Severe acute respiratory syndrome coronavirus 2 mRNA only vaccine product</span></p><p><b>forecastStatus</b>: <span title=\"Codes: {http://terminology.hl7.org/CodeSystem/immunization-recommendation-status contraindicated}\">Contraindicated</span></p><p><b>forecastReason</b>: <span title=\"Codes: {http://terminology.hl7.org/CodeSystem/v3-ActReason MEDPREC}\">medical precaution</span></p><h3>DateCriterions</h3><table class=\"grid\"><tr><td>-</td><td><b>Code</b></td><td><b>Value</b></td></tr><tr><td>*</td><td><span title=\"Codes: {http://loinc.org 30980-7}\">Date vaccine due</span></td><td>2025-02-07</td></tr></table><p><b>doseNumber</b>: 2</p><p><b>seriesDoses</b>: 2</p><p><b>supportingImmunization</b>: <a href=\"#Immunization_42befbaf-eba8-44ec-b7d6-0e4a996e0760\">See above (Immunization/42befbaf-eba8-44ec-b7d6-0e4a996e0760)</a></p></blockquote></div>"
-          },
-          "patient": {
-            "reference": "urn:uuid:2b90dd2b-2dab-4c75-9bb9-a355e07401e8"
-          },
-          "date": "2025-02-05",
-          "recommendation": [
-            {
-              "vaccineCode": [
-                {
-                  "coding": [
-                    {
-                      "system": "http://snomed.info/sct",
-                      "code": "1119349007",
-                      "display": "Severe acute respiratory syndrome coronavirus 2 mRNA only vaccine product"
-                    }
-                  ]
-                }
-              ],
-              "forecastStatus": {
-                "coding": [
-                  {
-                    "system": "http://terminology.hl7.org/CodeSystem/immunization-recommendation-status",
-                    "code": "contraindicated"
-                  }
-                ]
-              },
-              "forecastReason": [
-                {
-                  "coding": [
-                    {
-                      "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
-                      "code": "MEDPREC",
-                      "display": "medical precaution"
-                    }
-                  ]
-                }
-              ],
-              "dateCriterion": [
-                {
-                  "code": {
-                    "coding": [
-                      {
-                        "system": "http://loinc.org",
-                        "code": "30980-7",
-                        "display": "Date vaccine due"
-                      }
-                    ]
-                  },
-                  "value": "2025-02-07"
-                }
-              ],
-              "doseNumberPositiveInt": 2,
-              "seriesDosesPositiveInt": 2,
-              "supportingImmunization": [
-                {
-                  "reference": "urn:uuid:42befbaf-eba8-44ec-b7d6-0e4a996e0760"
-                }
-              ]
-            }
-          ]
-        }
-      },
-      {
-        "fullUrl": "urn:uuid:45a5c5b1-4ec1-4d60-b4b2-ff5a84a41fd7",
-        "resource": {
-          "resourceType": "Organization",
-          "id": "45a5c5b1-4ec1-4d60-b4b2-ff5a84a41fd7",
-          "text": {
-            "status": "generated",
-            "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><p><b>Generated Narrative</b></p><p><b>identifier</b>: id: 090903</p><p><b>name</b>: AZ. OSPEDALIERO - UNIVERSITARIA CAREGGI</p></div>"
-          },
-          "identifier": [
-            {
-              "system": "http://terminology.hl7.it/CodeSystem/minsan-hsp",
-              "value": "090903"
-            }
-          ],
-          "name": "AZ. OSPEDALIERO - UNIVERSITARIA CAREGGI"
-        }
-      },
-      {
-        "fullUrl": "urn:uuid:b66c1b23-21e9-4bd0-9cd7-edd806c126de",
-        "resource": {
-          "resourceType": "Organization",
-          "id": "b66c1b23-21e9-4bd0-9cd7-edd806c126de",
-          "text": {
-            "status": "generated",
-            "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><p><b>Generated Narrative</b></p><p><b>identifier</b>: id: 090</p><p><b>name</b>: Regione Toscana</p></div>"
-          },
-          "identifier": [
-            {
-              "system": "http://terminology.hl7.it/CodeSystem/minsan-regione",
-              "value": "090"
-            }
-          ],
-          "name": "Regione Toscana"
-        }
-      },
-      {
-        "fullUrl": "urn:uuid:d7a490a1-d267-4785-ac98-db56748827fb",
-        "resource": {
-          "resourceType": "Practitioner",
-          "id": "d7a490a1-d267-4785-ac98-db56748827fb",
-          "text": {
-            "status": "generated",
-            "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><p><b>Generated Narrative</b></p><p><b>identifier</b>: id: VRDRCR70H08H703B</p></div>"
-          },
-          "identifier": [
-            {
-              "system": "http://hl7.it/sid/codiceFiscale",
-              "value": "VRDRCR70H08H703B"
-            }
-          ]
-        }
-      },
-      {
-        "fullUrl": "urn:uuid:42befbaf-eba8-44ec-b7d6-0e4a996e0760",
-        "resource": {
-          "resourceType": "Immunization",
-          "id": "42befbaf-eba8-44ec-b7d6-0e4a996e0760",
-          "text": {
-            "status": "generated",
-            "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><p><b>Generated Narrative</b></p><p><b>status</b>: completed</p><p><b>vaccineCode</b>: <span title=\"Codes: {http://snomed.info/sct 1119349007}, {https://www.aifa.gov.it/aic 049283}\">COVID-19 Vaccine Moderna</span></p><p><b>patient</b>: <a href=\"#Patient_2b90dd2b-2dab-4c75-9bb9-a355e07401e8\">See above (Patient/2b90dd2b-2dab-4c75-9bb9-a355e07401e8)</a></p><p><b>occurrence</b>: 2025-01-10</p><p><b>location</b>: <a href=\"#Location_55a5c5b1-4ec1-4d60-b4b2-ff5a84a41fd8\">See above (Location/55a5c5b1-4ec1-4d60-b4b2-ff5a84a41fd8)</a></p><p><b>manufacturer</b>: <span>MODERNA BIOTECH SPAIN, S.L.</span></p><p><b>lotNumber</b>: B1235742</p><blockquote><p><b>performer</b></p><p><b>actor</b>: <a href=\"#Organization_45a5c5b1-4ec1-4d60-b4b2-ff5a84a41fd7\">Ospedale Careggi - Firenze. Generated Summary: id: 090903; name: AZ. OSPEDALIERO - UNIVERSITARIA CAREGGI</a></p></blockquote><blockquote><p><b>performer</b></p><p><b>actor</b>: <a href=\"#Practitioner_d7a490a1-d267-4785-ac98-db56748827fb\">See above (Practitioner/d7a490a1-d267-4785-ac98-db56748827fb)</a></p></blockquote><h3>ProtocolApplieds</h3><table class=\"grid\"><tr><td>-</td><td><b>TargetDisease</b></td><td><b>DoseNumber[x]</b></td><td><b>SeriesDoses[x]</b></td></tr><tr><td>*</td><td><span title=\"Codes: {http://hl7.org/fhir/sid/icd-10 J12.82}\">Pneumonia due to coronavirus disease 2019</span></td><td>1</td><td>2</td></tr></table></div>"
-          },
-          "status": "completed",
-          "vaccineCode": {
-            "coding": [
-              {
-                "system": "http://snomed.info/sct",
-                "code": "1119349007",
-                "display": "Severe acute respiratory syndrome coronavirus 2 mRNA only vaccine product"
-              },
-              {
-                "system": "https://www.aifa.gov.it/aic",
-                "code": "049283",
-                "display": "COVID-19 Vaccine Moderna"
-              }
-            ],
-            "text": "COVID-19 Vaccine Moderna"
-          },
-          "patient": {
-            "reference": "urn:uuid:2b90dd2b-2dab-4c75-9bb9-a355e07401e8"
-          },
-          "occurrenceDateTime": "2025-01-10",
-          "location": {
-            "reference": "urn:uuid:55a5c5b1-4ec1-4d60-b4b2-ff5a84a41fd8"
-          },
-          "manufacturer": {
-            "display": "MODERNA BIOTECH SPAIN, S.L."
-          },
-          "lotNumber": "B1235742",
-          "performer": [
-            {
-              "actor": {
-                "reference": "urn:uuid:45a5c5b1-4ec1-4d60-b4b2-ff5a84a41fd7",
-                "display": "Ospedale Careggi - Firenze"
               }
             },
             {
-              "actor": {
-                "reference": "urn:uuid:d7a490a1-d267-4785-ac98-db56748827fb"
+              "fullUrl": "urn:uuid:patient-1",
+              "resource": {
+                "resourceType": "Patient",
+                "id": "patient-1",
+                "gender": "female",
+                "birthDate": "1991-01-01"
+              }
+            },
+            {
+              "fullUrl": "urn:uuid:vitalsign-1",
+              "resource": {
+                "resourceType": "Observation",
+                "id": "vitalsign-1",
+                "status": "final",
+                "code": { "coding": [{ "system": "http://loinc.org", "code": "8867-4" }] },
+                "subject": { "reference": "urn:uuid:patient-1" },
+                "valueQuantity": { "value": 72, "unit": "beats/minute" }
               }
             }
-          ],
-          "protocolApplied": [
-            {
-              "targetDisease": [
-                {
-                  "coding": [
-                    {
-                      "system": "http://hl7.org/fhir/sid/icd-10",
-                      "code": "J12.82",
-                      "display": "Pneumonia due to coronavirus disease 2019"
-                    }
-                  ]
-                }
-              ],
-              "doseNumberPositiveInt": 1,
-              "seriesDosesPositiveInt": 2
-            }
           ]
-        }
-      },
-      {
-        "fullUrl": "urn:uuid:55a5c5b1-4ec1-4d60-b4b2-ff5a84a41fd8",
-        "resource": {
-          "resourceType": "Location",
-          "id": "55a5c5b1-4ec1-4d60-b4b2-ff5a84a41fd8",
-          "text": {
-            "status": "generated",
-            "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><p><b>Generated Narrative</b></p><p><b>name</b>: AZ. OSPEDALIERO - UNIVERSITARIA CAREGGI</p><p><b>address</b>: Firenze IT </p></div>"
-          },
-          "name": "AZ. OSPEDALIERO - UNIVERSITARIA CAREGGI",
-          "address": {
-            "city": "Firenze",
-            "country": "IT"
-          }
         }
       }
     ]
@@ -1392,4 +2377,309 @@ curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/individual/org.hl
 
 **Expected Response:** `202 Accepted`. After polling, a successful response confirms that the patient's Unified Health Index has been updated with the new entry, allowing any other authorized provider to discover this new piece of health information.
 
+#### 10.B Bundle of `Communication` entries (conversational emergency intake)
+
+Use a FHIR Bundle with `type="batch"` and multiple `Communication` entries when you are collecting *free-text, conversational* statements that will later be:
+- stored confidentially (raw text is expected to contain PII),
+- optionally anonymized under a subject-scoped policy,
+- and optionally transformed into derived clinical signals (e.g., Observation / AllergyIntolerance / MedicationStatement / DeviceUsage) with `meta.tag[]` for downstream routing or “ledger-safe” publication.
+
+This is not the same as the **FHIR Bundle `document`** upload in **Section 10**:
+- **Bundle `document`** is a document package with a `Composition` index (clinical in this guide's examples, but reusable in other sectors).
+- **Bundle `batch` of Communications** is a message log/intake stream and does not require a full clinical FHIR mapping at capture time.
+
+**Endpoint:** `POST /{tenantId}/cds-{jurisdiction}/v1/{sector}/individual/org.hl7.fhir.api/Communication/_batch`
+
+**`curl` Example (8 messages in one batch):**
+```bash
+curl -X POST 'http://localhost:3000/acme/cds-es/v1/emergency/individual/org.hl7.fhir.api/Communication/_batch' \
+--header 'App-ID: [APP-ID]' \
+--header 'App-Version: [APP-VERSION]' \
+--header 'Authorization: Bearer [SMART_TOKEN_FOR_INDIVIDUAL_COMMUNICATION]' \
+--header 'Content-Type: application/didcomm-plaintext+json' \
+--data '{
+  "jti": "emergency-intake-communication-request-<test-id>",
+  "thid": "emergency-intake-thread-<test-id>",
+  "iss": "did:web:api.acme.org:individual:<unified-health-identifier>:device:<uuid>",
+  "aud": "did:web:api.acme.org",
+  "exp": 1678886460,
+  "iat": 1678886400,
+  "nbf": 1678886400,
+  "type": "org.hl7.fhir.api.Bundle",
+  "body": {
+    "resourceType": "Bundle",
+    "type": "batch",
+    "entry": [
+      {
+        "meta": {
+          "claims": {
+            "@context": "org.hl7.fhir.api",
+            "@type": "Communication:EmergencyIntake",
+            "Communication.category": "http://terminology.hl7.org/CodeSystem/communication-category|alert",
+            "Communication.partOf": "urn:uuid:emergency-intake-thread-<test-id>",
+            "Communication.subject": "did:web:api.acme.org:individual:<unified-health-identifier>",
+            "Communication.recipient": "did:web:api.acme.org:individual:<unified-health-identifier>",
+            "Communication.sent": "2025-11-27T19:59:00Z",
+            "Communication.text": "Personal details: My name is Jaime Lobos del Río. I was born on 1965-08-24."
+          }
+        },
+        "request": { "method": "POST", "url": "individual/org.hl7.fhir.api/Communication" }
+      },
+      {
+        "meta": {
+          "claims": {
+            "@context": "org.hl7.fhir.api",
+            "@type": "Communication:EmergencyIntake",
+            "Communication.category": "http://terminology.hl7.org/CodeSystem/communication-category|alert",
+            "Communication.partOf": "urn:uuid:emergency-intake-thread-<test-id>",
+            "Communication.subject": "did:web:api.acme.org:individual:<unified-health-identifier>",
+            "Communication.recipient": "did:web:api.acme.org:individual:<unified-health-identifier>",
+            "Communication.sent": "2025-11-27T20:00:00Z",
+            "Communication.text": "Allergies: I am allergic to latex and peanuts."
+          }
+        },
+        "request": { "method": "POST", "url": "individual/org.hl7.fhir.api/Communication" }
+      },
+      {
+        "meta": { "claims": {
+          "@context": "org.hl7.fhir.api",
+          "@type": "Communication:EmergencyIntake",
+          "Communication.category": "http://terminology.hl7.org/CodeSystem/communication-category|alert",
+          "Communication.partOf": "urn:uuid:emergency-intake-thread-<test-id>",
+          "Communication.subject": "did:web:api.acme.org:individual:<unified-health-identifier>",
+          "Communication.recipient": "did:web:api.acme.org:individual:<unified-health-identifier>",
+          "Communication.sent": "2025-11-27T20:01:00Z",
+          "Communication.text": "Current conditions: I have type 2 diabetes. I also injured my knee about 6 months ago (not severe)."
+        }},
+        "request": { "method": "POST", "url": "individual/org.hl7.fhir.api/Communication" }
+      },
+      {
+        "meta": { "claims": {
+          "@context": "org.hl7.fhir.api",
+          "@type": "Communication:EmergencyIntake",
+          "Communication.category": "http://terminology.hl7.org/CodeSystem/communication-category|alert",
+          "Communication.partOf": "urn:uuid:emergency-intake-thread-<test-id>",
+          "Communication.subject": "did:web:api.acme.org:individual:<unified-health-identifier>",
+          "Communication.recipient": "did:web:api.acme.org:individual:<unified-health-identifier>",
+          "Communication.sent": "2025-11-27T20:02:00Z",
+          "Communication.text": "Recent encounters and diagnoses: About 6 months ago I went to the ER with chest pain, sweating, and palpitations. I was diagnosed with a panic attack related to grief after my wife died."
+        }},
+        "request": { "method": "POST", "url": "individual/org.hl7.fhir.api/Communication" }
+      },
+      {
+        "meta": { "claims": {
+          "@context": "org.hl7.fhir.api",
+          "@type": "Communication:EmergencyIntake",
+          "Communication.category": "http://terminology.hl7.org/CodeSystem/communication-category|alert",
+          "Communication.partOf": "urn:uuid:emergency-intake-thread-<test-id>",
+          "Communication.subject": "did:web:api.acme.org:individual:<unified-health-identifier>",
+          "Communication.recipient": "did:web:api.acme.org:individual:<unified-health-identifier>",
+          "Communication.sent": "2025-11-27T20:03:00Z",
+          "Communication.text": "Behavioral Health: I feel sad and have little motivation. I do not feel like going out, driving, meeting people, or talking on the phone."
+        }},
+        "request": { "method": "POST", "url": "individual/org.hl7.fhir.api/Communication" }
+      },
+      {
+        "meta": { "claims": {
+          "@context": "org.hl7.fhir.api",
+          "@type": "Communication:EmergencyIntake",
+          "Communication.category": "http://terminology.hl7.org/CodeSystem/communication-category|alert",
+          "Communication.partOf": "urn:uuid:emergency-intake-thread-<test-id>",
+          "Communication.subject": "did:web:api.acme.org:individual:<unified-health-identifier>",
+          "Communication.recipient": "did:web:api.acme.org:individual:<unified-health-identifier>",
+          "Communication.sent": "2025-11-27T20:04:00Z",
+          "Communication.text": "Medications and adverse effects: I was prescribed anti-anxiety medication, but it made me feel more tired and I had dizziness and nausea, so my treatment was changed. I have an appointment with a psychologist next Friday at 11:00 at Imaginaria Clinic."
+        }},
+        "request": { "method": "POST", "url": "individual/org.hl7.fhir.api/Communication" }
+      },
+      {
+        "meta": { "claims": {
+          "@context": "org.hl7.fhir.api",
+          "@type": "Communication:EmergencyIntake",
+          "Communication.category": "http://terminology.hl7.org/CodeSystem/communication-category|alert",
+          "Communication.partOf": "urn:uuid:emergency-intake-thread-<test-id>",
+          "Communication.subject": "did:web:api.acme.org:individual:<unified-health-identifier>",
+          "Communication.recipient": "did:web:api.acme.org:individual:<unified-health-identifier>",
+          "Communication.sent": "2025-11-27T20:05:00Z",
+          "Communication.text": "Care plan: My doctors told me to reduce alcohol consumption because of the medication. I am trying to drink less when I am alone at home."
+        }},
+        "request": { "method": "POST", "url": "individual/org.hl7.fhir.api/Communication" }
+      },
+      {
+        "meta": { "claims": {
+          "@context": "org.hl7.fhir.api",
+          "@type": "Communication:EmergencyIntake",
+          "Communication.category": "http://terminology.hl7.org/CodeSystem/communication-category|alert",
+          "Communication.partOf": "urn:uuid:emergency-intake-thread-<test-id>",
+          "Communication.subject": "did:web:api.acme.org:individual:<unified-health-identifier>",
+          "Communication.recipient": "did:web:api.acme.org:individual:<unified-health-identifier>",
+          "Communication.sent": "2025-11-27T20:06:00Z",
+          "Communication.text": "Primary care: My reference clinic/primary care doctor is at Imaginaria Clinic."
+        }},
+        "request": { "method": "POST", "url": "individual/org.hl7.fhir.api/Communication" }
+      }
+    ]
+  }
+}' -i
+```
+
+**Expected Response:** `202 Accepted` with a `Location` header. Polling retrieves the outcome of the communication job.
+
+##### 10.B.1 Emergency summary for a clinician (derived bundle document)
+
+In an emergency flow, a clinician (e.g., a doctor in the ER) can be shown a compact **Bundle `document`** summary derived from the intake communications. The backend (or a dedicated anonymization/derivation service) builds a `Composition` index with the relevant sections and attaches one derived resource per section.
+
+Important: the derived **research/routing tags** are returned at the **bundle payload** level in `body.meta.tag[]` (not inside each FHIR resource). This keeps platform metadata separate from the clinical resources while still using a familiar FHIR `Coding`-like shape.
+
+Because a derived summary may include multiple resources of the same type, `body.meta.tag[].id` MUST be unique and SHOULD be indexed per resource type, e.g. `Observation[0].code`, `Observation[1].code`, etc. (counter starts at `0` per resource type).
+
+Example (simplified; tags on the bundle, not inside the resources):
+```json
+{
+  "type": "org.hl7.fhir.api.Bundle",
+  "body": {
+    "resourceType": "Bundle",
+    "type": "document",
+    "meta": {
+      "tag": [
+        { "id": "Observation[0].code", "system": "<coding-system>", "code": "<latex-allergy-code>", "display": "Allergy to latex (anonymized)", "userSelected": true },
+        { "id": "Observation[0].code", "system": "<coding-system>", "code": "<peanut-allergy-code>", "display": "Allergy to peanuts (anonymized)", "userSelected": true },
+        { "id": "Observation[1].code", "system": "<coding-system>", "code": "<type2-diabetes-code>", "display": "Type 2 diabetes mellitus (anonymized)", "userSelected": true },
+        { "id": "Observation[2].code", "system": "<coding-system>", "code": "<medication-code>", "display": "Medication-related statement (derived)", "userSelected": true },
+        { "id": "Observation[3].code", "system": "<coding-system>", "code": "<implanted-device-code>", "display": "Implanted device statement (derived)", "userSelected": true }
+      ]
+    },
+    "entry": [
+    {
+      "fullUrl": "urn:uuid:<composition-uuid>",
+      "resource": {
+        "resourceType": "Composition",
+        "status": "final",
+        "type": { "coding": [{ "system": "http://loinc.org", "code": "60591-5" }] },
+        "title": "Emergency Summary (Derived)",
+        "subject": { "reference": "did:web:api.acme.org:individual:<unified-health-identifier>" },
+        "date": "2025-11-27T20:05:00Z",
+        "section": [
+          { "title": "Allergies", "code": { "coding": [{ "system": "http://loinc.org", "code": "48765-2" }] }, "entry": [{ "reference": "urn:uuid:<obs-allergy>" }] },
+          { "title": "Problems", "code": { "coding": [{ "system": "http://loinc.org", "code": "11450-4" }] }, "entry": [{ "reference": "urn:uuid:<obs-problem>" }] },
+          { "title": "Medications", "code": { "coding": [{ "system": "http://loinc.org", "code": "10160-0" }] }, "entry": [{ "reference": "urn:uuid:<obs-medication>" }] },
+          { "title": "Implanted devices", "code": { "coding": [{ "system": "http://loinc.org", "code": "46264-8" }] }, "entry": [{ "reference": "urn:uuid:<obs-device>" }] }
+        ]
+      }
+    },
+    { "fullUrl": "urn:uuid:<obs-allergy>", "resource": { "resourceType": "Observation", "status": "final" } },
+    { "fullUrl": "urn:uuid:<obs-problem>", "resource": { "resourceType": "Observation", "status": "final" } },
+    { "fullUrl": "urn:uuid:<obs-medication>", "resource": { "resourceType": "Observation", "status": "final" } },
+    { "fullUrl": "urn:uuid:<obs-device>", "resource": { "resourceType": "Observation", "status": "final" } }
+  ]
+  }
+}
+```
+
+**Persistence note:** the backend stores derived tags outside the encrypted `content` (so they remain usable for routing/analytics without decrypting) in the Confidential Storage document (e.g., `ConfidentialStorageDoc.tag[]`).
+
+**Ledger-safe note:** `meta.tag[].display` is allowed for UI and review, but must be removed (or allowlisted) before writing to any shared ledger. The platform enforces this by sanitizing tags in the backend and again in the chaincode/smart-contract layer.
+
 ---
+
+## 11. Blockchain Certification (Seal/Verify) — planned endpoints
+
+This section documents the **intended** API surface for certifying artifacts on blockchain **without** updating an individual's index and **without** publishing research tags (research flag remains `false`).
+
+This is used for traceability and later attestation/provenance, e.g.:
+- a practitioner certifies a document/bundle produced by a hospital system,
+- a device vendor certifies a device implant artifact,
+- or an auditor verifies that a published artifact hash exists on-ledger.
+
+### 11.1 Status and environments
+
+- In `DEMO_BLOCKCHAIN=false` the backend typically runs with a mock/in-memory adapter and **does not** submit to blockchain.
+- In `DEMO_BLOCKCHAIN=true` (development) the backend is expected to connect to a local blockchain devnet (see `devnet/fabric-v3/README.md`).
+
+### 11.2 Endpoint shape (seal)
+
+Seal a Bundle of artifacts (each entry is independently certified):
+
+`POST /cds-<jurisdiction>/v1/<sector>/blockchain/org.hl7.fhir.api/Bundle/_seal`
+
+Notes:
+- `org.hl7.fhir.api` is used as the canonical “claims-first” format (flat interoperable claims / FHIR API search params semantics).
+- Prior to hashing, the backend normalizes the artifact (remove volatile fields, sort keys deterministically) and computes the `assetId` hash.
+- The response is a FHIR Bundle (batch-response/transaction-response) with one entry per sealed artifact, including `meta.audit` (tx metadata) when available.
+
+**`curl` Example (DIDComm plaintext, sending a FHIR Bundle):**
+```bash
+BASE_URL="http://localhost:3000"
+TENANT="acme"
+JUR="ES"
+SECTOR="health-care"
+TOKEN="$RECEPTIONIST1_ID_TOKEN"
+
+curl -i -X POST "${BASE_URL}/${TENANT}/cds-${JUR}/v1/${SECTOR}/blockchain/org.hl7.fhir.api/Bundle/_seal" \
+  -H "Authorization: Bearer ${TOKEN}" \
+  -H "Content-Type: application/didcomm-plaintext+json" \
+  --data-raw '{
+    "type": "org.hl7.fhir.api.Bundle",
+    "thid": "thid-seal-001",
+    "iss": "did:web:api.acme.org:employee:receptionist1@acme.org:ISCO-08|4226",
+    "aud": "did:web:api.acme.org",
+    "body": {
+      "resourceType": "Bundle",
+      "type": "batch",
+      "entry": [
+        { "resource": { "resourceType": "Composition", "id": "urn:uuid:ips-1" } },
+        { "resource": { "resourceType": "Observation", "id": "urn:uuid:vitalsign-1" } }
+      ]
+    }
+  }'
+```
+
+### 11.3 Endpoint shape (verify)
+
+Verify a previously sealed `assetId` (or list of ids) on-ledger:
+
+`POST /cds-<jurisdiction>/v1/<sector>/blockchain/org.hl7.fhir.api/Bundle/_verify`
+
+**`curl` Example (verify by asset id):**
+```bash
+BASE_URL="http://localhost:3000"
+TENANT="acme"
+JUR="ES"
+SECTOR="health-care"
+TOKEN="$RECEPTIONIST1_ID_TOKEN"
+
+curl -i -X POST "${BASE_URL}/${TENANT}/cds-${JUR}/v1/${SECTOR}/blockchain/org.hl7.fhir.api/Bundle/_verify" \
+  -H "Authorization: Bearer ${TOKEN}" \
+  -H "Content-Type: application/json" \
+  --data-raw '{
+    "id": "z<multibase58btc(multihash(...))>"
+  }'
+```
+
+**Response shape (success):**
+```json
+{
+  "resourceType": "Bundle",
+  "type": "batch-response",
+  "total": 1,
+  "entry": [
+    {
+      "resource": { "resourceType": "Basic", "id": "z<assetId>" },
+      "meta": { "audit": { "txId": "<fabric-tx-id>", "txTime": "<iso>" } },
+      "response": { "status": "200" }
+    }
+  ]
+}
+```
+
+**Response shape (not found):**
+```json
+{
+  "resourceType": "Bundle",
+  "type": "batch-response",
+  "total": 0,
+  "entry": [
+    { "resource": { "id": "z<assetId>" }, "response": { "status": "404" } }
+  ]
+}
+```
