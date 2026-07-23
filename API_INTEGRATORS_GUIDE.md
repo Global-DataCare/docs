@@ -5,6 +5,59 @@ This guide provides a comprehensive, step-by-step walkthrough for the complete A
 **Interactive Documentation:** All endpoints are documented and can be tested interactively via the Swagger UI at the `/api-docs` endpoint of the running service.
 **Online test deployment:** https://globaldatacare-test-961105121121.europe-southwest1.run.app/api-docs
 
+## Onboarding Flow Split (Normative)
+
+Use two separate onboarding narratives. Do not merge them into one step list.
+
+### Identity Route Canon (Normative)
+
+Canonical identity route family for new integrations (SDK-aligned):
+
+- `/host/cds-{jurisdiction}/v1/{sector}/{tenantId}/identity/auth/_exchange`
+- `/host/cds-{jurisdiction}/v1/{sector}/{tenantId}/identity/auth/_dcr`
+- `/host/cds-{jurisdiction}/v1/{sector}/{tenantId}/identity/auth/_issue`
+- `/host/cds-{jurisdiction}/v1/{sector}/{tenantId}/identity/auth/_code`
+- `/host/cds-{jurisdiction}/v1/{sector}/{tenantId}/identity/auth/_token`
+
+Temporary backward compatibility:
+- Existing `/{tenantId}/.../identity/openid/...` endpoints remain available during migration.
+- They are compatibility aliases and should not be used as the primary contract for new integrations.
+
+### A) Legal Organization Onboarding (tenant/controller, B2B)
+
+Canonical sequence:
+
+1. ICA identity proof and verification (`_verify`) to obtain proof artifacts (`vp_token` and optional VC JWTs).
+2. Gateway host activation: `POST /host/cds-{jurisdiction}/v1/{sector}/registry/org.schema/Organization/_activate`.
+3. Extract Offer from activation result (`org.schema.Offer.*`) and show commercial summary (amount/currency/licenses) to the user.
+4. Confirm Order (always, even when amount is `0`):
+   `POST /host/cds-{jurisdiction}/v1/{sector}/registry/org.schema/Order/_batch`
+   with `Order.acceptedOffer.identifier`.
+5. Use controller activation code from Order result (`org.schema.IndividualProduct.serialNumber`) and execute:
+   - `POST /host/cds-{jurisdiction}/v1/{sector}/{tenantId}/identity/auth/_exchange`
+   - `POST /host/cds-{jurisdiction}/v1/{sector}/{tenantId}/identity/auth/_dcr`
+6. With controller device active, create employee profiles:
+   `POST /{tenantId}/cds-{jurisdiction}/v1/{sector}/entity/org.schema/Employee/_batch`
+7. For additional employees/devices, issue activation invitations from license pool:
+   `POST /host/cds-{jurisdiction}/v1/{sector}/{tenantId}/identity/auth/_issue`
+   then each invited user runs `_exchange` + `_dcr`.
+8. Post-DCR token lifecycle (`private_key_jwt`, token exchange/SMART) for protected operations.
+
+Important: if a web app already completed ICA `_verify` and has the VC/proof, the next required step is GW `_activate` before continuing with protected tenant flows.
+
+### B) Personal Organization Onboarding (individual/family/subject)
+
+Canonical sequence:
+
+1. Personal/family organization registration:
+   `POST /{tenantId}/cds-{jurisdiction}/v1/{sector}/individual/org.schema/Organization/_batch`.
+2. Offer acceptance via order confirmation:
+   `POST /{tenantId}/cds-{jurisdiction}/v1/{sector}/individual/org.schema/Order/_batch`.
+3. Continue with consent and subject clinical data flows.
+
+Implementation note:
+- Keep legal-organization activation (`host/registry ... _activate`) and personal-organization registration (`individual ... Organization/_batch`) documented as different use cases with different actors and authorization prerequisites.
+
 ## 1. Vision: The Unified Health ID and Index
 
 The Gateway Service is the cornerstone of a shared data space, enabling individuals to maintain a real-time **Unified Health Index (UHIx)** through explicit, legally compliant consents. This capability is critical for enhancing personal safety, especially in emergencies where an individual may be unable to communicate, and for empowering users with varying levels of digital literacy or physical abilities.
@@ -331,7 +384,7 @@ HTTP requests must include the following headers:
 
 	**Jurisdiction meaning:** The `{jurisdiction}` segment is the jurisdiction code for the **provider/tenant** within the host-operated infrastructure (e.g., `ES` or `ES-CT`). It namespaces the CDS space and registry entries for that tenant under the host.
 
-For demonstration purposes, `Content-Type: application/didcomm-plaintext+json` (or `application/json`) is permitted. However, in production, all messages must be secured using the FAPI Security Profile (based on JAR and JARM), where `Content-Type: application/x-www-form-urlencoded` is used to submit and receive encrypted messages via the `request` and `response` form parameters.
+For demonstration purposes, `Content-Type: application/didcomm-plain+json` (or `application/json`) is permitted. However, in production, all messages must be secured using the FAPI Security Profile (based on JAR and JARM), where `Content-Type: application/x-www-form-urlencoded` is used to submit and receive encrypted messages via the `request` and `response` form parameters.
 
 ### Asynchronous jobs: submit vs poll (FAPI-style)
 
@@ -378,7 +431,7 @@ curl -X POST 'http://localhost:3000/host/cds-es/v1/test/registry/org.schema/Orga
 --header 'App-ID: [APP-ID]' \
 --header 'App-Version: [APP-VERSION]' \
 --header 'Authorization: Bearer [OIDC_ID_TOKEN_OF_LEGAL_REP]' \
---header 'Content-Type: application/didcomm-plaintext+json' \
+--header 'Content-Type: application/didcomm-plain+json' \
 --data '{
   "jti": "org-registration-request-<test-id>",
   "thid": "org-registration-thread-<test-id>",
@@ -434,7 +487,7 @@ curl -X POST 'http://localhost:3000/host/cds-es/v1/test/registry/org.schema/Orga
     "jws": {
       "protected": {
         "typ": "application/didcomm-signed+json",
-        "cty": "application/didcomm-plaintext+json",
+        "cty": "application/didcomm-plain+json",
         "alg": "ML-DSA-44",
         "kid": "thumbprint-public-sig-key-device",
         "jwk": {
@@ -601,7 +654,7 @@ curl -X POST 'http://localhost:3000/host/cds-es/v1/test/registry/org.schema/Orde
     "jws": {
       "protected": {
         "typ": "application/didcomm-signed+json",
-        "cty": "application/didcomm-plaintext+json",
+        "cty": "application/didcomm-plain+json",
         "alg": "ML-DSA-44",
         "kid": "thumbprint-public-sig-key-device"
       }
@@ -734,7 +787,7 @@ The `:sector` parameter in the URL path has a specific meaning:
 
 -   For tenant-specific operations (like creating an employee or customer), the `:sector` is the tenant's own operational sector (e.g., `health-care`, `health-insurance`).
 
-For demo purposes, use `Content-Type: application/didcomm-plaintext+json` in the HTTP Header. In production the requisite is to enable secure DIDComm messages using the FAPI Security Profile (based on JAR and JARM), where `Content-Type: application/x-www-form-urlencoded` enables the `request` and `response` form parameters to submit and receive the encrypted messages.
+For demo purposes, use `Content-Type: application/didcomm-plain+json` in the HTTP Header. In production the requisite is to enable secure DIDComm messages using the FAPI Security Profile (based on JAR and JARM), where `Content-Type: application/x-www-form-urlencoded` enables the `request` and `response` form parameters to submit and receive the encrypted messages.
 
 The following documentation explains the flow for demo purposes.
 
@@ -766,7 +819,7 @@ This endpoint is always DIDComm (plaintext in demo, encrypted in production).
 
 **Endpoint:** `POST /{tenantId}/cds-{jurisdiction}/v1/{sector}/identity/firebase/Token/_custom`
 
-- Header: `Content-Type: application/didcomm-plaintext+json`
+- Header: `Content-Type: application/didcomm-plain+json`
 
 ```json
 {
@@ -922,7 +975,7 @@ This endpoint is always DIDComm (plaintext in demo, encrypted in production).
 **Endpoint:** `POST /{tenantId}/cds-{jurisdiction}/v1/{sector}/identity/openid/Token/_exchange`
 
 - Header: `Authorization: Bearer <firebase_id_token>`
-- Header: `Content-Type: application/didcomm-plaintext+json`
+- Header: `Content-Type: application/didcomm-plain+json`
 
 Important:
 - `Authorization` must carry a valid JWT identity token (`firebase id_token` in current profile).
@@ -1225,7 +1278,7 @@ For production, the DIDComm message must be a JWE wrapping a JWS. The headers of
 -   `alg` (required): The JWA algorithm used for signing (e.g., `ML-DSA-44`).
 -   `kid` (required): The identifier of the client's private key used to sign the JWT.
 -   `typ` (required): Must be `"application/didcomm-signed+json"`.
--   `cty` (recommended): `"application/didcomm-plaintext+json"` (the signed payload is a DIDComm plaintext JSON object).
+-   `cty` (recommended): `"application/didcomm-plain+json"` (the signed payload is a DIDComm plaintext JSON object).
 -   `jku` (optional): The URL pointing to the JWK Set containing the public key. This is not mandatory, as the key can be resolved from the `iss` claim (`did:web`).
 
 **Embedding `jwk` in headers (bootstrap):** In bootstrap flows where the server cannot yet resolve the sender keys from a stored DID/JWKS (e.g., the very first onboarding request), the request may embed a public `jwk` in the header. In that case, keep the embedded `jwk` minimal (thumbprint material only), omitting `kid` and `use`.
@@ -1261,7 +1314,7 @@ The connector is responsible for issuing the access token. Before doing so, it v
 # This curl example shows the plaintext DIDComm message representing the SMART /authorize request object (JAR).
 # In production, this payload would be signed and encrypted according to the headers above.
 curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/identity/openid/smart/token' \
---header 'Content-Type: application/didcomm-plaintext+json' \
+--header 'Content-Type: application/didcomm-plain+json' \
 --data '{
   "jti": "smart-token-request-<test-id>",
   "thid": "smart-token-thread-<test-id>",
@@ -1308,7 +1361,7 @@ curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/identity/openid/s
     "jws": {
       "protected": {
         "typ": "application/didcomm-signed+json",
-        "cty": "application/didcomm-plaintext+json",
+        "cty": "application/didcomm-plain+json",
         "alg": "ML-DSA-44",
         "kid": "thumbprint-public-sig-key-device"
       }
@@ -1348,7 +1401,7 @@ curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/entity/org.schema
 --header 'App-Version: [APP-VERSION]' \
 # The Bearer token is a SMART access_token with 'organization/PractitionerRole.crus' scope.
 --header 'Authorization: Bearer [SMART_TOKEN_FOR_ADMIN]' \
---header 'Content-Type: application/didcomm-plaintext+json' \
+--header 'Content-Type: application/didcomm-plain+json' \
 --data '{
   "jti": "employeerole-registration-request-<test-id>",
   "thid": "employeerole-registration-thread-<test-id>",
@@ -1429,7 +1482,7 @@ curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/individual/org.sc
 --header 'App-Version: [APP-VERSION]' \
 # Authorization is the individual's OIDC id_token.
 --header 'Authorization: Bearer [OIDC_ID_TOKEN_OF_INDIVIDUAL]' \
---header 'Content-Type: application/didcomm-plaintext+json' \
+--header 'Content-Type: application/didcomm-plain+json' \
 --data '{
   "jti": "family-registration-request-<test-id>",
   "thid": "family-registration-thread-<test-id>",
@@ -1480,7 +1533,7 @@ curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/individual/org.sc
     "jws": {
       "protected": {
         "typ": "application/didcomm-signed+json",
-        "cty": "application/didcomm-plaintext+json",
+        "cty": "application/didcomm-plain+json",
         "alg": "ML-DSA-44",
         "kid": "thumbprint-public-sig-key-device",
         "jwk": {
@@ -1503,7 +1556,7 @@ To complete the registration, the individual must accept the `Offer` by submitti
 ```bash
 curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/individual/org.schema/Order/_batch' \
 --header 'Authorization: Bearer [OIDC_ID_TOKEN_OF_INDIVIDUAL]' \
---header 'Content-Type: application/didcomm-plaintext+json' \
+--header 'Content-Type: application/didcomm-plain+json' \
 --data '{
   "jti": "family-order-request-<test-id>",
   "thid": "family-order-thread-<test-id>",
@@ -1540,7 +1593,7 @@ curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/individual/org.hl
 --header 'App-ID: [APP-ID]' \
 --header 'App-Version: [APP-VERSION]' \
 --header 'Authorization: Bearer [SMART_TOKEN_FOR_CONTROLLER]' \
---header 'Content-Type: application/didcomm-plaintext+json' \
+--header 'Content-Type: application/didcomm-plain+json' \
 --data '{
   "jti": "family-relationship-message-<test-id>",
   "thid": "thid-family-relationship",
@@ -1590,7 +1643,7 @@ curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/individual/org.hl
 --header 'App-ID: [APP-ID]' \
 --header 'App-Version: [APP-VERSION]' \
 --header 'Authorization: Bearer [SMART_TOKEN_FOR_CONTROLLER]' \
---header 'Content-Type: application/didcomm-plaintext+json' \
+--header 'Content-Type: application/didcomm-plain+json' \
 --data '{
   "jti": "personal-observation-message-<test-id>",
   "thid": "thid-personal-observation",
@@ -1646,7 +1699,7 @@ curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/individual/org.hl
 --header 'App-ID: [APP-ID]' \
 --header 'App-Version: [APP-VERSION]' \
 --header 'Authorization: Bearer [SMART_TOKEN_MANAGE_CONSENT]' \
---header 'Content-Type: application/didcomm-plaintext+json' \
+--header 'Content-Type: application/didcomm-plain+json' \
 --data '{
   "jti": "consent-fhir-request-<test-id>",
   "thid": "consent-fhir-thread-<test-id>",
@@ -2130,7 +2183,7 @@ curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/individual/org.hl
 --header 'App-ID: [APP-ID]' \
 --header 'App-Version: [APP-VERSION]' \
 --header 'Authorization: Bearer [SMART_TOKEN_SEND_COMMUNICATION]' \
---header 'Content-Type: application/didcomm-plaintext+json' \
+--header 'Content-Type: application/didcomm-plain+json' \
 --data '{
   "jti": "communication-fhir-request-<test-id>",
   "thid": "communication-fhir-thread-<test-id>",
@@ -2216,7 +2269,7 @@ curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/individual/org.hl
 --header 'App-Version: [APP-VERSION]' \
 # Token obtained by the external practitioner with scope 'patient/Composition.u?subject=<unified-health-identifier>'
 --header 'Authorization: Bearer [SMART_TOKEN_FOR_COMPOSITION]' \
---header 'Content-Type: application/didcomm-plaintext+json' \
+--header 'Content-Type: application/didcomm-plain+json' \
 --data '{
   "jti": "composition-update-request-<test-id>",
   "thid": "composition-update-thread-<test-id>",
@@ -2308,7 +2361,7 @@ curl -X POST 'http://localhost:3000/acme/cds-es/v1/health-care/individual/org.hl
 --header 'App-Version: [APP-VERSION]' \
 # Token obtained by the external practitioner with scope 'patient/Bundle.c?subject=<unified-health-identifier>'
 --header 'Authorization: Bearer [SMART_TOKEN_FOR_BUNDLE_DOC]' \
---header 'Content-Type: application/didcomm-plaintext+json' \
+--header 'Content-Type: application/didcomm-plain+json' \
 --data '{
   "jti": "document-update-request-<test-id>",
   "thid": "document-update-thread-<test-id>",
@@ -2397,7 +2450,7 @@ curl -X POST 'http://localhost:3000/acme/cds-es/v1/emergency/individual/org.hl7.
 --header 'App-ID: [APP-ID]' \
 --header 'App-Version: [APP-VERSION]' \
 --header 'Authorization: Bearer [SMART_TOKEN_FOR_INDIVIDUAL_COMMUNICATION]' \
---header 'Content-Type: application/didcomm-plaintext+json' \
+--header 'Content-Type: application/didcomm-plain+json' \
 --data '{
   "jti": "emergency-intake-communication-request-<test-id>",
   "thid": "emergency-intake-thread-<test-id>",
@@ -2618,7 +2671,7 @@ TOKEN="$RECEPTIONIST1_ID_TOKEN"
 
 curl -i -X POST "${BASE_URL}/${TENANT}/cds-${JUR}/v1/${SECTOR}/blockchain/org.hl7.fhir.api/Bundle/_seal" \
   -H "Authorization: Bearer ${TOKEN}" \
-  -H "Content-Type: application/didcomm-plaintext+json" \
+  -H "Content-Type: application/didcomm-plain+json" \
   --data-raw '{
     "type": "org.hl7.fhir.api.Bundle",
     "thid": "thid-seal-001",
