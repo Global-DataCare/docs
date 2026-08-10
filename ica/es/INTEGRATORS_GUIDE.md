@@ -3,7 +3,8 @@
 Guia de integracion para el flujo asincrono de verificacion de terminos PDF firmados digitalmente.
 
 Para operativa CLI ICA (onboarding, CSR, DCAT), ver:
-[`CLI_OPERATIONS_RUNBOOK.md`](./CLI_OPERATIONS_RUNBOOK.md)
+La operación interna de CA, firma y despliegue no forma parte de esta guía
+pública para integradores y se mantiene en documentación privada separada.
 
 ## 0) Resumen del contrato vigente
 
@@ -422,7 +423,7 @@ Notas:
 ```
 
 # 2) Permiso cross-project para pull de imágenes
-gcloud projects add-iam-policy-binding globaldatacare-ica-dev \
+gcloud projects add-iam-policy-binding <artifact-project> \
   --member="serviceAccount:$default" \
   --role="roles/artifactregistry.reader"
 
