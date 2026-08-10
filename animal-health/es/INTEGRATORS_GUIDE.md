@@ -8,7 +8,7 @@ Objetivo: convertir exportaciones locales (Excel/CSV) a payload interoperable y 
 
 Hay dos servicios distintos:
 
-1. API de preconversión: transforma Excel/CSV a un mensaje con `body.data[]` (conjunto de uno o varios `Composition`, uno por gemelo digital).
+1. API de preconversión: transforma Excel/CSV a un mensaje con `body.data[]` (conjunto de uno o varios `Patient`, uno por sujeto), donde cada `Patient` incluye `contained[]` con `Composition`, `DocumentReference` y `Encounter`.
 2. API del conector al data space: recibe ese mensaje y actualiza colecciones de research (`digitaltwin`).
 
 Ejemplo de dominios:
@@ -22,6 +22,7 @@ Todas las operaciones de negocio son HTTP asíncronas:
 
 - La acción inicial (`_create`, `_upload`, `_batch`) responde `202 Accepted`.
 - El servidor devuelve `Location` (endpoint `*-response`) y `Retry-After`.
+- En `202` de `_create` no hay body funcional; la app debe usar `Location` y conservar el `thid` que envió.
 - La app cliente debe hacer polling con `POST` al `*-response` hasta estado terminal.
 
 1. Crear configuración de organización/software en API de preconversión.
@@ -38,9 +39,11 @@ Ambos flujos son asíncronos, pero el contrato actual no es totalmente simétric
 
 - `config/_create-response`:
   - `200` significa terminal.
-  - En la respuesta final el `status` puede ser `succeeded` o `failed`.
-  - Si envías `thid/jti`, la API puede aceptar `POST .../_create` y devolver el fallo en `_create-response` con `status=failed`.
-  - Si no envías `thid/jti`, los errores de validación/auth se devuelven directamente en `POST .../_create`.
+  - La respuesta final viene como `Bundle` (`batch-response`) en `body.data[]`.
+  - Cada entry trae `response.status` + `response.outcome` (`OperationOutcome`).
+  - En polling sí puede devolverse `thid` para trazabilidad.
+  - Si envías `thid`, la API puede aceptar `POST .../_create` y devolver el fallo en `_create-response` como entry con `response.status` `4xx/5xx`.
+  - Si no envías `thid`, los errores de validación/auth se devuelven directamente en `POST .../_create`.
   - Es de consumo único (POP): si lo lees una vez, deja de estar disponible.
   - `401` significa credenciales inválidas o no aceptadas.
   - `500` significa error interno del servidor.
@@ -48,6 +51,7 @@ Ambos flujos son asíncronos, pero el contrato actual no es totalmente simétric
 - `conversion/_upload-response`:
   - `202` significa en progreso (`queued` o `running`).
   - `200` significa terminal, pero puede ser `succeeded` o `failed`.
+  - En polling sí puede devolverse `thid` para trazabilidad.
   - Por eso aquí no basta con HTTP `200`: hay que revisar `status`.
   - `401` significa credenciales inválidas o no aceptadas.
   - `500` significa error interno del servidor.
@@ -92,9 +96,20 @@ curl -sS -X POST "$BASE_PRECONV/host/cds-$JUR/v1/animal-care/$ALT/config/didcomm
             "subfamily": "SUBFAMILIA",
             "concept": "CONCEPTO",
             "subjectId": "CHIP",
+            "sourceId": "IDARTICULO",
             "species": "ESPECIE",
             "date": "FECHA",
             "time": "HORA"
+          },
+          "fieldDefaults": {},
+          "allowedSections": ["clinica"],
+          "excludedSectionFamilies": ["clinica:vacunas"],
+          "loincBySectionFamily": {
+            "clinica:laboratorio": "30954-2",
+            "clinica:consultas": "34109-9",
+            "clinica:cirugia": "11504-8",
+            "clinica:medicamentos": "10160-0",
+            "clinica:varios": "11503-0"
           }
         }
       }
@@ -103,6 +118,27 @@ curl -sS -X POST "$BASE_PRECONV/host/cds-$JUR/v1/animal-care/$ALT/config/didcomm
 }
 JSON
 ```
+
+Nota:
+- Guarda `CFG_THID` en cliente; lo necesitarás en `.../_create-response`.
+- No esperes `thid` en el body de la respuesta inicial `202` de `.../_create`.
+
+Referencia de config base Qvet:
+
+- `$HOME/GITS/gdc-workspace/adapter-ingestion-py/configs/qvet.schema.example.json`
+
+Regla importante de calidad:
+
+- `loincBySectionFamily` debe cubrir las categorías clínicas que quieras publicar.
+- Si una fila no tiene mapeo LOINC para su `section:family`, la preconversión la omite.
+- Por cada fila omitida se añade una entrada `OperationOutcome` dentro de `body.data[]`.
+- Esa entrada incluye `response.outcome` y `OperationOutcome.rowNumber` para identificar la fila.
+- Además, `_upload-response` lo resume en `outcome.issue[].diagnostics` (con filas de muestra).
+
+En una configuración completa también se suelen incluir:
+
+- `speciesLocalToFhirCode` (texto local -> código FHIR species).
+- `runtimeDefaults` (por ejemplo `language`, `subjectKind`, `subjectDidPrefix`, `includeFields`).
 
 Polling:
 
@@ -128,13 +164,13 @@ Endpoint:
 
 Ejemplo con el fichero de prueba:
 
-`/Users/fernando/GITS/gdc-workspace/adapter-ingestion-py/examples/input/exampleQvetES.xlsx`
+`$HOME/GITS/gdc-workspace/adapter-ingestion-py/examples/input/exampleQvetES.xlsx`
 
 ```bash
 UP_THID="up-$(uuidgen)"
 
 curl -i -sS -X POST "$BASE_PRECONV/$ALT/cds-$JUR/v1/animal-care/conversion/$SOFTWARE_ID/excel/_upload" \
-  -F "file=@/Users/fernando/GITS/gdc-workspace/adapter-ingestion-py/examples/input/exampleQvetES.xlsx" \
+  -F "file=@$HOME/GITS/gdc-workspace/adapter-ingestion-py/examples/input/exampleQvetES.xlsx" \
   -F "iss=$ISS" \
   -F "thid=$UP_THID" \
   -F "jti=$UP_THID" \
@@ -142,6 +178,9 @@ curl -i -sS -X POST "$BASE_PRECONV/$ALT/cds-$JUR/v1/animal-care/conversion/$SOFT
   -F "iat=$NOW" \
   -F "exp=$EXP"
 ```
+
+Nota:
+- Guarda `UP_THID` en cliente; lo necesitarás en `.../_upload-response`.
 
 Polling:
 
@@ -159,14 +198,15 @@ curl -sS -X POST "$BASE_PRECONV/$ALT/cds-$JUR/v1/animal-care/conversion/$SOFTWAR
 JSON
 ```
 
-Cuando termine (`status=succeeded`), la respuesta incluye un resumen del proceso y el mensaje preconvertido listo para envío.
+Cuando termine (`status=succeeded`), la respuesta incluye el mensaje DIDComm listo para envío.
+Si hubo filas omitidas por mapeo, `body.data[]` incluirá recursos `OperationOutcome`.
 
-Ejemplo de mensaje objetivo para ingesta research en el conector:
+Ejemplos de mensaje preconvertido:
 
-- `/Users/fernando/GITS/gdc-workspace/gwtemplate-node-ts/src/__tests__/data/example-payloads.ts`
-- constante: `RESEARCH_COMPOSITION_INGESTION_MESSAGE`
+- `$HOME/GITS/gdc-workspace/adapter-ingestion-py/examples/current-output/composition-message.sample.json`
+- `$HOME/GITS/gdc-workspace/adapter-ingestion-py/docs/es/12-ejemplos-salida-actual.md`
 
-Ejemplo (contenido de `data.message`, listo para enviar al conector):
+Ejemplo (mensaje DIDComm listo para enviar al conector):
 
 ```json
 {
@@ -180,62 +220,104 @@ Ejemplo (contenido de `data.message`, listo para enviar al conector):
     "type": "batch",
     "data": [
       {
-        "type": "Composition",
         "resource": {
-          "resourceType": "Composition",
-          "id": "urn:uuid:0dbe2f39-3f6a-48a3-9807-2f9a102f1a11",
+          "resourceType": "Patient",
+          "id": "82ef6455-9c10-59a3-9f73-440939a6adc3",
           "meta": {
             "claims": {
-              "@context": "org.hl7.fhir.api",
-              "@type": "Composition:ResearchDigitalTwin",
-              "Composition.subject": "did:web:connector.example.com:animal:multihash:z3vYh7w9q2p1k4m8n6a5b4c3d2e1f0",
-              "Composition.section": "LOINC|26436-6",
-              "Composition.type": "LOINC|60591-5",
-              "Composition.date": "2026-01-31T10:45:00Z",
-              "Composition.author": "",
-              "Composition.entry": "urn:uuid:c2b1f9ee-90d4-4f1d-8dc6-4c3f0b29621b,urn:uuid:aad1f0bc-5781-42dc-9d8f-30252fbce6a9"
+              "Patient.identifier": "did:web:example.org:animal:subject:zW1jubAfgQFCTho9XgbZXhfekVLNAc4KBmCicaijNywzqpN",
+              "Patient.active": "true",
+              "Patient.language": "es-ES"
             }
           },
           "contained": [
             {
-              "resourceType": "DocumentReference",
-              "id": "urn:uuid:c2b1f9ee-90d4-4f1d-8dc6-4c3f0b29621b",
+              "resourceType": "Composition",
+              "id": "40304495-a1bd-53d9-b7ea-8d7c8b0655eb",
               "meta": {
                 "claims": {
-                  "@context": "org.hl7.fhir.api",
-                  "@type": "DocumentReference:Lab",
-                  "DocumentReference.subject": "did:web:connector.example.com:animal:multihash:z3vYh7w9q2p1k4m8n6a5b4c3d2e1f0",
-                  "DocumentReference.identifier": "urn:uuid:c2b1f9ee-90d4-4f1d-8dc6-4c3f0b29621b",
-                  "DocumentReference.type": "http://loinc.org|26436-6",
-                  "DocumentReference.category": "http://loinc.org|26436-6",
-                  "DocumentReference.status": "current",
-                  "DocumentReference.date": "2026-01-15T09:00:00Z",
-                  "DocumentReference.description": "Laboratorio propio"
+                  "Composition.identifier": "40304495-a1bd-53d9-b7ea-8d7c8b0655eb",
+                  "Composition.subject": "did:web:example.org:animal:subject:zW1jubAfgQFCTho9XgbZXhfekVLNAc4KBmCicaijNywzqpN",
+                  "Composition.section": "http://loinc.org|11369-6",
+                  "Composition.author": "",
+                  "Composition.date": "2026-03-05T01:21:34.680892+00:00",
+                  "Composition.type": "http://loinc.org|11369-6",
+                  "Composition.title": "immunizations index",
+                  "Composition.entry": "urn:uuid:3827b617-5938-5292-898d-852f9296d8f9,urn:uuid:01e85565-0cad-5313-b0d0-c430c6fabd9d"
+                }
+              }
+            },
+            {
+              "resourceType": "Encounter",
+              "id": "3827b617-5938-5292-898d-852f9296d8f9",
+              "meta": {
+                "claims": {
+                  "Encounter.identifier": "3827b617-5938-5292-898d-852f9296d8f9",
+                  "Encounter.subject": "did:web:example.org:animal:subject:zW1jubAfgQFCTho9XgbZXhfekVLNAc4KBmCicaijNywzqpN",
+                  "Encounter.date": "2026-01-01T10:00:00Z",
+                  "Encounter.status": "finished",
+                  "Encounter.class": "http://terminology.hl7.org/CodeSystem/v3-ActCode|AMB"
                 }
               }
             },
             {
               "resourceType": "DocumentReference",
-              "id": "urn:uuid:aad1f0bc-5781-42dc-9d8f-30252fbce6a9",
+              "id": "01e85565-0cad-5313-b0d0-c430c6fabd9d",
               "meta": {
                 "claims": {
-                  "@context": "org.hl7.fhir.api",
-                  "@type": "DocumentReference:Imaging",
-                  "DocumentReference.subject": "did:web:connector.example.com:animal:multihash:z3vYh7w9q2p1k4m8n6a5b4c3d2e1f0",
-                  "DocumentReference.identifier": "urn:uuid:aad1f0bc-5781-42dc-9d8f-30252fbce6a9",
-                  "DocumentReference.type": "http://loinc.org|18748-4",
-                  "DocumentReference.category": "http://loinc.org|18726-0",
-                  "DocumentReference.status": "current",
-                  "DocumentReference.date": "2026-01-16T12:30:00Z",
-                  "DocumentReference.description": "Diagnostico por imagen propio"
+                  "DocumentReference.identifier": "01e85565-0cad-5313-b0d0-c430c6fabd9d",
+                  "DocumentReference.subject": "did:web:example.org:animal:subject:zW1jubAfgQFCTho9XgbZXhfekVLNAc4KBmCicaijNywzqpN",
+                  "DocumentReference.author": "",
+                  "DocumentReference.date": "2026-01-01T10:00:00Z",
+                  "DocumentReference.type": "urn:gdc:wakyma:clinica:vacunas:vacuna-perro",
+                  "DocumentReference.category": "http://loinc.org|11369-6",
+                  "DocumentReference.description": "Vacuna anual",
+                  "DocumentReference.language": "es-ES"
                 }
               }
             }
           ]
+        }
+      },
+      {
+        "resource": {
+          "resourceType": "OperationOutcome",
+          "id": "urn:uuid:29e88ddd-5253-504f-a26b-a8f84d59e991",
+          "issue": [
+            {
+              "severity": "warning",
+              "code": "processing",
+              "details": {
+                "text": "Row skipped during preconversion."
+              },
+              "diagnostics": "Missing required LOINC mapping for section:family 'clinica:laboratorio'."
+            }
+          ],
+          "meta": {
+            "claims": {
+              "@context": "org.hl7.fhir.api",
+              "@type": "OperationOutcome:PreconversionRowIssue",
+              "OperationOutcome.rowNumber": "42",
+              "OperationOutcome.sectionFamily": "clinica:laboratorio",
+              "OperationOutcome.issueCode": "missing-loinc-mapping"
+            }
+          }
         },
-        "request": {
-          "method": "POST",
-          "url": "digitaltwin/org.hl7.fhir.api/Composition"
+        "response": {
+          "status": "422",
+          "outcome": {
+            "resourceType": "OperationOutcome",
+            "issue": [
+              {
+                "severity": "warning",
+                "code": "processing",
+                "details": {
+                  "text": "Row skipped during preconversion."
+                },
+                "diagnostics": "Missing required LOINC mapping for section:family 'clinica:laboratorio'."
+              }
+            ]
+          }
         }
       }
     ]
@@ -288,12 +370,13 @@ Nota: el `thid` para polling en el conector debe ser el `thid` del mensaje que e
 La preconversión devuelve un mensaje con:
 
 - `body.data[]`
-- `data[].resource.resourceType = Composition`
-- `data[].resource.meta.claims` (claims de Composition)
-- `data[].resource.contained[].meta.claims` (normalmente DocumentReference)
-
-En esta fase, el flujo de research está centrado en Composition + DocumentReference.
-`Encounter` y `Patient` serán también añadidos.
+- `data[].resource.resourceType = Patient` (principal por sujeto).
+- `data[].resource.meta.claims` (claims de Patient).
+- `data[].resource.contained[]` incluye `Composition`, `DocumentReference` y `Encounter` del mismo sujeto.
+- `data[].resource.contained[].meta.claims` guarda claims interoperables por recurso.
+- Agrupación actual: **1 Patient por sujeto**.
+- Si un sujeto tiene varias secciones (`section:family`), se representan como varias `Composition` dentro de `Patient.contained[]`.
+- La relación sección -> recursos se mantiene en `Composition.entry` (referencias `urn:uuid:` a recursos de `contained[]`).
 
 ## 7) Nota técnica (opcional)
 
@@ -302,18 +385,18 @@ El mensaje de preconversión se basa en:
 - DIDComm v2 plaintext message (envoltorio del mensaje).
 - Un híbrido de JSON:API y FHIR Bundle:
   - estilo JSON:API para `body.data[]`;
-  - recursos FHIR (`Composition`, `contained[]`) dentro de cada item.
+  - recursos FHIR (`Patient` + `contained[]`) dentro de cada item.
 
 ## 8) Reglas prácticas de integración
 
 - Se puede comprimir el payload; indícalo en el header HTTP: `Content-Encoding: gzip`.
 - Mantén separados los dominios de preconversión y conector.
 - Usa siempre polling asíncrono: acción y acción con sufijo `-response`.
-- Usa `data.message` de `_upload-response` como payload para el conector y así alimentar las colecciones de datos anonimizadas (gemelos digitales anónimos).
+- Usa el mensaje DIDComm de `_upload-response` (con `body.data[]`) como payload para el conector y así alimentar las colecciones de datos anonimizadas (gemelos digitales anónimos).
 
 ## 9) Referencias
 
-- Preconversión API: `/Users/fernando/GITS/gdc-workspace/adapter-ingestion-py/docs/es/08-api-config-multitenant.md`
-- Preconversión E2E local: `/Users/fernando/GITS/gdc-workspace/adapter-ingestion-py/docs/es/API_DEVELOPMENT_GUIDE.md`
-- Conector (research digital twin): `/Users/fernando/GITS/gdc-workspace/gwtemplate-node-ts/docs/API_INTEGRATORS_GUIDE.md`
-- Ejemplo payload research del conector: `/Users/fernando/GITS/gdc-workspace/gwtemplate-node-ts/src/__tests__/data/example-payloads.ts` (`RESEARCH_COMPOSITION_INGESTION_MESSAGE`)
+- Preconversión API: `$HOME/GITS/gdc-workspace/adapter-ingestion-py/docs/es/08-api-config-multitenant.md`
+- Preconversión E2E local: `$HOME/GITS/gdc-workspace/adapter-ingestion-py/docs/es/API_DEVELOPMENT_GUIDE.md`
+- Conector (research digital twin): `$HOME/GITS/gdc-workspace/gwtemplate-node-ts/docs/API_INTEGRATORS_GUIDE.md`
+- Ejemplo payload research del conector: `$HOME/GITS/gdc-workspace/gwtemplate-node-ts/src/__tests__/data/example-payloads.ts` (`RESEARCH_COMPOSITION_INGESTION_MESSAGE`)
