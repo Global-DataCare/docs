@@ -13,16 +13,12 @@ TERMINOLOGY_BASE_URL=https://terminology-st.connecthealth.info
 TERMINOLOGY_OIDC_CLIENT_ID=globaldatacare-portal-bff
 ```
 
-The issuer configuration is:
-
-```dotenv
-GDC_OIDC_ISSUER=https://globaldatacare.es
-```
-
 The service base URL is also the token audience, so no second audience variable
-is required. The URL and client ID are not secrets. Reuse the existing
-server-owned `ES384` OpenID issuer wallet and its protected key; do not create a
-second key or introduce a new seed specifically for Terminology.
+is required. The URL and client ID are not secrets. The BFF must also reuse its
+existing issuer value (`https://globaldatacare.es`); do not duplicate it in a
+Terminology-specific environment variable. Reuse the existing server-owned
+`ES384` OpenID issuer wallet and its protected key; do not create a second key
+or introduce a new seed specifically for Terminology.
 
 Install exact released packages:
 
@@ -41,12 +37,12 @@ professional or organization controller.
 // src/server/terminology-identity.ts
 import 'server-only';
 import {
+  issuer,
   issuerContext,
   issuerWallet,
   issuerWalletReady,
 } from './existing-gdc-oidc-issuer';
 
-const issuer = requiredEnv('GDC_OIDC_ISSUER');
 const terminologyBaseUrl = requiredEnv('TERMINOLOGY_BASE_URL').replace(/\/+$/, '');
 const clientId = requiredEnv('TERMINOLOGY_OIDC_CLIENT_ID');
 
