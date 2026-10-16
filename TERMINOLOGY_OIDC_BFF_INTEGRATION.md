@@ -9,8 +9,7 @@ signing to a terminology package.
 The terminology service operator supplies:
 
 ```dotenv
-TERMINOLOGY_BASE_URL=https://terminology.example
-TERMINOLOGY_OIDC_AUDIENCE=https://terminology.example
+TERMINOLOGY_BASE_URL=https://terminology-st.connecthealth.info
 TERMINOLOGY_OIDC_CLIENT_ID=globaldatacare-portal-bff
 ```
 
@@ -21,8 +20,10 @@ GDC_OIDC_ISSUER=https://globaldatacare.es
 GDC_OIDC_ISSUER_SEED=<secret-manager-reference>
 ```
 
-The audience and client ID are not secrets. The issuer seed is a server-only
-secret and must remain in KMS or the hosting platform's secret manager.
+The service base URL is also the token audience, so no second audience variable
+is required. The URL and client ID are not secrets. The issuer seed is a
+server-only secret and must remain in KMS or the hosting platform's secret
+manager.
 
 Install exact released packages:
 
@@ -41,7 +42,7 @@ import 'server-only';
 import { NodeManagedWallet } from 'gdc-sdk-node-ts';
 
 const issuer = requiredEnv('GDC_OIDC_ISSUER');
-const audience = requiredEnv('TERMINOLOGY_OIDC_AUDIENCE');
+const terminologyBaseUrl = requiredEnv('TERMINOLOGY_BASE_URL').replace(/\/+$/, '');
 const clientId = requiredEnv('TERMINOLOGY_OIDC_CLIENT_ID');
 const issuerSeed = requiredEnv('GDC_OIDC_ISSUER_SEED');
 
@@ -52,7 +53,9 @@ const issuerContext = {
   },
 } as const;
 
-const issuerWallet = new NodeManagedWallet();
+const issuerWallet = new NodeManagedWallet({
+  policy: { defaults: { 'openid-id-token-signing': 'ML-DSA-44' } },
+});
 const ready = issuerWallet.provisionManagedKeys(issuerContext, {
   ownerScope: 'runtime',
   purposes: ['openid-id-token-signing'],
@@ -68,7 +71,7 @@ export async function createTerminologyAccessToken(): Promise<string> {
     claims: {
       iss: issuer,
       sub: `service:${clientId}`,
-      aud: audience,
+      aud: terminologyBaseUrl,
       client_id: clientId,
       azp: clientId,
       iat: now,
@@ -121,7 +124,7 @@ return Response.json(await getIssuerJwks(), {
 return Response.json({
   issuer: 'https://globaldatacare.es',
   jwks_uri: 'https://globaldatacare.es/.well-known/jwks.json',
-  id_token_signing_alg_values_supported: ['ES384'],
+  id_token_signing_alg_values_supported: ['ML-DSA-44'],
   subject_types_supported: ['public'],
   response_types_supported: ['id_token'],
 });
@@ -129,7 +132,13 @@ return Response.json({
 
 The `issuer` must exactly match the token's `iss`, including `https://` and the
 absence of a trailing slash. The JWKS must contain the public key with the same
-`kid` used in the JWT header.
+`kid` used in the JWT header. Both URLs must answer with
+`Content-Type: application/json`; a `200` response containing the portal HTML is
+not valid discovery and will be rejected.
+
+This ML-DSA key is the BFF service identity used only for BFF-to-Terminology
+calls. Existing ES384 keys and tokens required by SMART on FHIR, SHC or a GW
+user-login profile remain separate and do not need to change.
 
 SOS GW and UHC GW can either discover this `jwks_uri` from the OpenID document
 or receive it explicitly in their trusted-provider entry:
@@ -157,7 +166,7 @@ import {
 import { createTerminologyAccessToken } from './terminology-identity';
 
 export const terminology = new TerminologyClient({
-  baseUrl: requiredEnv('TERMINOLOGY_BASE_URL'),
+  baseUrl: requiredEnv('TERMINOLOGY_BASE_URL').replace(/\/+$/, ''),
   accessTokenProvider: createTerminologyAccessToken,
   cache: new MemoryTerminologyCache({ maxEntries: 2_000 }),
   candidateTtlMs: 5 * 60_000,
@@ -175,17 +184,39 @@ The terminology service configures the corresponding trusted provider:
 [
   {
     "iss": "https://globaldatacare.es",
-    "aud": "https://terminology.example",
+    "aud": "https://terminology-st.connecthealth.info",
     "jwksUri": "https://globaldatacare.es/.well-known/jwks.json",
     "clientIds": ["globaldatacare-portal-bff"],
-    "algorithms": ["ES384"]
+    "algorithms": ["ML-DSA-44"]
   }
 ]
 ```
 
-This JSON becomes `TERMINOLOGY_TRUSTED_OIDC_PROVIDERS_JSON` in the terminology
-API deployment. The concrete service URL, audience and assigned client ID must
-come from the operator; do not copy the example hostnames into production.
+The terminology staging deployment already trusts that exact issuer, audience,
+client ID, JWKS URL and algorithm. GlobalDataCare must now publish the two JSON
+well-known endpoints and deploy its BFF wallet. No shared static terminology
+token is required after that succeeds.
+
+## Acceptance check
+
+Before calling the terminology routes, verify that the well-known endpoints
+return JSON:
+
+```bash
+curl --fail --show-error https://globaldatacare.es/.well-known/jwks.json
+curl --fail --show-error https://globaldatacare.es/.well-known/openid-configuration
+```
+
+Then mint one five-minute `at+jwt` using `createTerminologyAccessToken()` and
+call:
+
+```http
+GET https://terminology-st.connecthealth.info/v1/terminology/capabilities?sector=<authorized-sector>&jurisdiction=<authorized-jurisdiction>
+Authorization: Bearer <server-generated-token>
+```
+
+Acceptance is `200`. A missing bearer must remain `401`. Do not print the seed
+or token in build logs.
 
 The canonical wallet API and issuer-publication explanation remain in
 [`gdc-sdk-node-ts/docs/101-SDK_END_TO_END.md`](https://github.com/Global-DataCare/gdc-sdk-node-ts/blob/main/docs/101-SDK_END_TO_END.md#two-proofs-are-required-and-they-are-not-interchangeable).
