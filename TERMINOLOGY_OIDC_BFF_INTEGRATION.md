@@ -17,13 +17,12 @@ The issuer configuration is:
 
 ```dotenv
 GDC_OIDC_ISSUER=https://globaldatacare.es
-GDC_OIDC_ISSUER_SEED=<secret-manager-reference>
 ```
 
 The service base URL is also the token audience, so no second audience variable
-is required. The URL and client ID are not secrets. The issuer seed is a
-server-only secret and must remain in KMS or the hosting platform's secret
-manager.
+is required. The URL and client ID are not secrets. Reuse the existing
+server-owned `ES384` OpenID issuer wallet and its protected key; do not create a
+second key or introduce a new seed specifically for Terminology.
 
 Install exact released packages:
 
@@ -31,40 +30,28 @@ Install exact released packages:
 npm install --save-exact gdc-sdk-node-ts@2.9.31 terminology-sdk-node-ts@0.3.1
 ```
 
-## Provision the issuer wallet once
+## Reuse the existing issuer wallet
 
-Create one server-only singleton. This is the OpenID issuer wallet, not the
-wallet of the logged-in person, professional or organization controller.
+Use the same server-only `NodeManagedWallet`, execution context and
+`openid-id-token-signing` key that GlobalDataCare already uses to issue its
+`ES384` SMART/GW tokens. This is not the wallet of the logged-in person,
+professional or organization controller.
 
 ```ts
 // src/server/terminology-identity.ts
 import 'server-only';
-import { NodeManagedWallet } from 'gdc-sdk-node-ts';
+import {
+  issuerContext,
+  issuerWallet,
+  issuerWalletReady,
+} from './existing-gdc-oidc-issuer';
 
 const issuer = requiredEnv('GDC_OIDC_ISSUER');
 const terminologyBaseUrl = requiredEnv('TERMINOLOGY_BASE_URL').replace(/\/+$/, '');
 const clientId = requiredEnv('TERMINOLOGY_OIDC_CLIENT_ID');
-const issuerSeed = requiredEnv('GDC_OIDC_ISSUER_SEED');
-
-const issuerContext = {
-  runtime: {
-    runtimeId: 'globaldatacare-oidc-issuer',
-    runtimeType: 'web-bff',
-  },
-} as const;
-
-const issuerWallet = new NodeManagedWallet({
-  policy: { defaults: { 'openid-id-token-signing': 'ML-DSA-44' } },
-});
-const ready = issuerWallet.provisionManagedKeys(issuerContext, {
-  ownerScope: 'runtime',
-  purposes: ['openid-id-token-signing'],
-  seedMaterial: issuerSeed,
-  mode: 'deterministic',
-});
 
 export async function createTerminologyAccessToken(): Promise<string> {
-  await ready;
+  await issuerWalletReady;
   const now = Math.floor(Date.now() / 1_000);
   return issuerWallet.signCompactJws!(issuerContext, {
     header: { typ: 'at+jwt' },
@@ -85,7 +72,7 @@ export async function createTerminologyAccessToken(): Promise<string> {
 }
 
 export async function getIssuerJwks() {
-  await ready;
+  await issuerWalletReady;
   return {
     keys: (await issuerWallet.getPublicJwks(issuerContext, {
       ownerScope: 'runtime',
@@ -101,9 +88,10 @@ function requiredEnv(name: string): string {
 }
 ```
 
-In production, prefer a KMS/HSM-backed wallet adapter. A deterministic seed is
-shown because it is supported by the released package, but the seed must never
-be committed or exposed to the browser.
+`existing-gdc-oidc-issuer` above represents the existing GlobalDataCare module;
+adapt only that import path to the BFF. The signed service token has a different
+audience and claims from a user token, but it is signed by the same `ES384`
+issuer key. The private key must never be committed or exposed to the browser.
 
 ## Publish the issuer metadata and JWKS
 
@@ -124,7 +112,7 @@ return Response.json(await getIssuerJwks(), {
 return Response.json({
   issuer: 'https://globaldatacare.es',
   jwks_uri: 'https://globaldatacare.es/.well-known/jwks.json',
-  id_token_signing_alg_values_supported: ['ML-DSA-44'],
+  id_token_signing_alg_values_supported: ['ES384'],
   subject_types_supported: ['public'],
   response_types_supported: ['id_token'],
 });
@@ -136,9 +124,11 @@ absence of a trailing slash. The JWKS must contain the public key with the same
 `Content-Type: application/json`; a `200` response containing the portal HTML is
 not valid discovery and will be rejected.
 
-This ML-DSA key is the BFF service identity used only for BFF-to-Terminology
-calls. Existing ES384 keys and tokens required by SMART on FHIR, SHC or a GW
-user-login profile remain separate and do not need to change.
+Publish the same `ES384` issuer public key already used to validate
+GlobalDataCare SMART/GW tokens. Terminology does not require a separate
+ML-DSA key. Do not send an existing user `id_token` to Terminology: mint a
+short-lived backend access token with the Terminology audience using that same
+issuer key.
 
 SOS GW and UHC GW can either discover this `jwks_uri` from the OpenID document
 or receive it explicitly in their trusted-provider entry:
@@ -187,15 +177,16 @@ The terminology service configures the corresponding trusted provider:
     "aud": "https://terminology-st.connecthealth.info",
     "jwksUri": "https://globaldatacare.es/.well-known/jwks.json",
     "clientIds": ["globaldatacare-portal-bff"],
-    "algorithms": ["ML-DSA-44"]
+    "algorithms": ["ES384"]
   }
 ]
 ```
 
-The terminology staging deployment already trusts that exact issuer, audience,
-client ID, JWKS URL and algorithm. GlobalDataCare must now publish the two JSON
-well-known endpoints and deploy its BFF wallet. No shared static terminology
-token is required after that succeeds.
+The terminology staging deployment trusts that exact issuer, audience, client
+ID, JWKS URL and `ES384` algorithm. GlobalDataCare must publish the two JSON
+well-known endpoints from its existing issuer implementation and add the
+Terminology-specific token minting call. No new wallet, ML-DSA key or shared
+static terminology token is required.
 
 ## Acceptance check
 
