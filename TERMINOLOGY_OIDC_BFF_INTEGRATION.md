@@ -164,6 +164,32 @@ export const terminology = new TerminologyClient({
 sends it as `Authorization: Bearer ...`. React never receives the wallet, seed
 or access token.
 
+## Connect the portal screen and Research
+
+After creating the singleton above, copy the canonical product-neutral
+examples from these sections:
+
+- BFF route that calls `searchCodeCandidatesFromText(...)` when the user presses
+  Search:
+  https://github.com/Global-DataCare/terminology-sdk-node-ts/blob/main/docs/NEXTJS_BFF_INTEGRATION.md#search-candidates-when-the-user-presses-search
+- Reusable React component that renders the candidates and returns the selected
+  `system|code`:
+  https://github.com/Global-DataCare/terminology-sdk-node-ts/blob/main/docs/NEXTJS_BFF_INTEGRATION.md#reusable-react-code-search-component
+- The same component used in a Research query builder:
+  https://github.com/Global-DataCare/terminology-sdk-node-ts/blob/main/docs/NEXTJS_BFF_INTEGRATION.md#use-the-same-component-in-research
+- Governed ValueSet dropdown with every valid option:
+  https://github.com/Global-DataCare/terminology-sdk-node-ts/blob/main/docs/NEXTJS_BFF_INTEGRATION.md#populate-a-dropdown-from-the-governed-valueset
+
+Both clinical data entry and the Research query builder call the same
+authenticated BFF candidate route. The user must select one intended
+`system|code`; only that selected pair is submitted to the create operation or
+to the exact Research filter. Do not submit all returned candidates as an
+implicit OR query.
+
+For an intentionally free-text Research search, query the indexed English
+`code-display` and the localized `code-text` instead. The code picker can then
+be offered as an explicit refinement to an exact `system|code` filter.
+
 The terminology service configures the corresponding trusted provider:
 
 ```json
